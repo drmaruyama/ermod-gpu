@@ -16,6 +16,24 @@
 ! along with this program; if not, write to the Free Software
 ! Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
+! =====================================================================
+! OpenMP target offload port (originally OpenACC; see realcal.F90 and
+! recpcal.F90 for the real-space and reciprocal-space kernels).
+!
+! This module owns sltlist, tagpt, uvengy, ecorr and insdst end to end
+! (allocation, transfer, and the kernels below), and together with
+! setconf.F90 covers the engmain-side arrays (charge, ljtype,
+! mol_begin_index, mol_charge, numsite, sluvid, ljlensq_mat, ljene_mat)
+! that realcal.F90 and recpcal.F90 reference.
+!
+! Known performance trade-off: update_histogram's correlation-matrix
+! update kernel is called up to a few hundred thousand times per run
+! (once per insertion trial) and showed noticeably higher per-launch
+! dispatch overhead under OpenMP target than under OpenACC on one
+! tested NVHPC/nvfortran toolchain. It is kept as OpenMP target here
+! regardless, since OpenACC is not a viable option on AMD/ROCm.
+! =====================================================================
+
 module engproc
   use precision_kinds, only: wp
   implicit none
@@ -95,8 +113,8 @@ contains
     !
     allocate( sltlist(numslt) )
     sltlist(1:numslt) = tplst(1:numslt)   ! list of solute molecules
-    !$acc enter data create(sltlist)
-    !$acc update device(sltlist)
+    !$omp target enter data map(alloc: sltlist)
+    !$omp target update to(sltlist)
     deallocate( tplst )
     !
     ! solute needs to be the last particle in reference system
@@ -299,7 +317,7 @@ contains
     if (corrcal == YES) then
        if (ermax > ermax_limit) call warning('emax')
        allocate( ecorr(ermax, ermax) )
-       !$acc enter data create(ecorr)
+       !$omp target enter data map(alloc: ecorr)
     endif
 
     if (selfcal == YES)  then
@@ -341,13 +359,13 @@ contains
     integer :: i, j
     edens(:) = 0.0
     if (corrcal == YES) then
-       !$acc parallel loop collapse(2) gang vector present(ecorr)
+       !$omp target teams distribute parallel do collapse(2) map(alloc: ecorr)
        do j = 1, ermax
           do i = 1, ermax
              ecorr(i,j) = 0.0
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
     end if
     if (selfcal == YES) eself(:) = 0.0
     if (slttype == SLT_SOLN) slnuv(:) = 0.0
@@ -420,11 +438,11 @@ contains
        allocate( uvengy0(maxdst) )
        allocate( uvengy(slvmax, maxdst) )
        allocate( skipcond(maxdst) )
-       !$acc enter data create(tagpt, uvengy)
+       !$omp target enter data map(alloc: tagpt, uvengy)
        initialized = .true.
     end if
     tagpt(1:slvmax) = tplst(1:slvmax)  ! and copied from tplst
-    !$acc update device(tagpt)
+    !$omp target update to(tagpt)
     deallocate( tplst )
 
     allocate( flceng_stored(maxdst) )
@@ -457,23 +475,23 @@ contains
 
        ! cntdst is the pick-up no. of solute molecule from plural solutes (soln)
        ! cntdst is the iteration no. of insertion (refs)
-       !$acc parallel loop collapse(2) gang vector present(uvengy)
+       !$omp target teams distribute parallel do collapse(2) map(alloc: uvengy)
        do j = 1, maxdst
           do i = 1, slvmax
              uvengy(i, j) = 0.0
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
        if (slttype == SLT_SOLN) then
           call get_uv_energy_soln(stnum, stat_weight_solute, uvengy0, uvengy, skipcond)
-          !$acc update self(uvengy)
+          !$omp target update from(uvengy)
           do cntdst = 1, maxdst
              if (skipcond(cntdst)) cycle
              call update_histogram(stat_weight_solute, uvengy0, uvengy, cntdst)
           enddo
        else
           call get_uv_energy_refs(stnum, stat_weight_solute, uvengy0, uvengy)
-          !$acc update self(uvengy)
+          !$omp target update from(uvengy)
           do cntdst = 1, maxdst
              call update_histogram(stat_weight_solute, uvengy0, uvengy, cntdst)
           enddo
@@ -588,13 +606,13 @@ contains
        if (slttype == SLT_SOLN) slnuv(:) = slnuv(:) * voffset_scale
        edens(:) = edens(:) * voffset_scale
        if (corrcal == YES) then
-          !$acc parallel loop collapse(2) gang vector present(ecorr)
+          !$omp target teams distribute parallel do collapse(2) map(alloc: ecorr)
           do j = 1, ermax
              do i = 1, ermax
                 ecorr(i, j) = ecorr(i, j) * voffset_scale
              end do
           end do
-          !$acc end parallel
+          !$omp end target teams distribute parallel do
        end if
 #endif
     endif
@@ -610,9 +628,9 @@ contains
     if (slttype == SLT_SOLN) call mympi_reduce_real_array(slnuv, numslv, mpi_sum, 0)
     call mympi_reduce_real8_array(edens, ermax, mpi_sum, 0)
     if (corrcal == YES) then
-       !$acc update self(ecorr)
+       !$omp target update from(ecorr)
        call mympi_reduce_real8_array(ecorr, (ermax * ermax), mpi_sum, 0)
-       !$acc update device(ecorr)
+       !$omp target update to(ecorr)
     end if
 #endif
 
@@ -632,13 +650,13 @@ contains
 
     edens(:) = edens(:) / engnorm
     if (corrcal == YES) then
-       !$acc parallel loop collapse(2) gang vector present(ecorr)
+       !$omp target teams distribute parallel do collapse(2) map(alloc: ecorr)
        do j = 1, ermax
           do i = 1, ermax
              ecorr(i, j) = ecorr(i, j) / engnorm
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
     end if
     if (selfcal == YES) eself(:) = eself(:) / engnorm
 
@@ -729,7 +747,7 @@ contains
           engfile = 'corref' // suffeng
        end select
        open(unit = cor_io, file = engfile, form = "UNFORMATTED", action = 'write')
-       !$acc update self(ecorr)
+       !$omp target update from(ecorr)
        write(cor_io) ecorr
        endfile(cor_io)
        close(cor_io)
@@ -946,7 +964,7 @@ contains
 
     if (.not. initialized) then
        allocate( insdst(ermax) )
-       !$acc enter data create(insdst)
+       !$omp target enter data map(alloc: insdst)
        initialized = .true.
     end if
 
@@ -1016,8 +1034,8 @@ contains
        edens(iduv) = edens(iduv) + engnmfc * real(k)
     enddo
     if (corrcal == YES) then
-       !$acc update device(insdst)
-       !$acc parallel loop present(insdst, ecorr)
+       !$omp target update to(insdst)
+       !$omp target teams distribute parallel do map(alloc: insdst, ecorr)
        do iduv = 1, ermax
           k = insdst(iduv)
           if (k == 0) cycle
@@ -1028,7 +1046,7 @@ contains
                   + engnmfc * real(k) * real(q)
           enddo
        enddo
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
     endif
 
   end subroutine update_histogram
@@ -1056,7 +1074,8 @@ contains
     real(wp) :: epcl
 
     ! called only when PME or PPPM, non-self interaction
-    !$acc parallel loop collapse(2) gang vector present(uvengy, mol_charge, tagpt, sltlist)
+    !$omp target teams distribute parallel do collapse(2) &
+    !$omp&   map(alloc: uvengy, mol_charge, tagpt, sltlist)
     do cnt = 1, maxdst
        do k = 1, slvmax
           tagslt = sltlist(cnt)
@@ -1065,10 +1084,11 @@ contains
 
           epcl = PI * mol_charge(tagslt) * mol_charge(i) &
                / screen / screen / volume
-          !$acc atomic update
+          !$omp atomic update
           uvengy(k, cnt) = uvengy(k, cnt) - epcl
        end do
     end do
+    !$omp end target teams distribute parallel do
   end subroutine residual_ene
 
   subroutine residual_ene_refs(tagslt, maxdst, slvmax, uvengy)
@@ -1081,15 +1101,16 @@ contains
     real(wp) :: epcl
 
     ! called only when PME or PPPM, non-self interaction
-    !$acc parallel loop collapse(2) gang vector present(uvengy, mol_charge)
+    !$omp target teams distribute parallel do collapse(2) map(alloc: uvengy, mol_charge)
     do cnt = 1, maxdst
        do k = 1, slvmax
           epcl = PI * mol_charge(tagslt) * mol_charge(k) &
                / screen / screen / volume
-          !$acc atomic update
+          !$omp atomic update
           uvengy(k, cnt) = uvengy(k, cnt) - epcl
        end do
     end do
+    !$omp end target teams distribute parallel do
   end subroutine residual_ene_refs
   !
   subroutine volcorrect(weight)

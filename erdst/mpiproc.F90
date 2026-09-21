@@ -41,7 +41,7 @@ module mpiproc
 
 contains
   subroutine mpi_setup(type)
-    use openacc
+    use omp_lib
     implicit none
     character(len=4) :: type
     integer :: i
@@ -51,7 +51,12 @@ contains
     if (type == 'init') then
        call mpi_init(ierror)
        call mpi_rank_size_info
-       call acc_set_device_num(local_rank, acc_device_nvidia)
+       ! Assign one GPU per MPI rank on the node (e.g. the 4 MI300A APUs
+       ! per node). OpenMP has no notion of "device type" like ACC's
+       ! acc_device_nvidia -- the target device kind is fixed by which
+       ! offload backend the compiler was built for, so only the device
+       ! number is selected here.
+       call omp_set_default_device(local_rank)
     endif
     if (type == 'stop') then
        call mpi_finalize(ierror)

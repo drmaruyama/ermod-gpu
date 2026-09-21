@@ -15,12 +15,62 @@ AS_IF([test x$enable_debug = xno],
       [ac_cv_prog_cc_g=no
        ac_cv_prog_fc_g=no])
 
+AC_ARG_WITH([gpu],
+    [AS_HELP_STRING([--with-gpu=nvidia|amd|none],
+        [Select GPU offload toolchain. Default: auto-detect from the
+         Fortran compiler (nvfortran -> nvidia, amdflang/flang-new -> amd)])],
+    [with_gpu=$withval], [with_gpu=auto])
+
+AC_ARG_WITH([offload-arch],
+    [AS_HELP_STRING([--with-offload-arch=ARCH],
+        [AMD GPU target architecture passed to --offload-arch, e.g. gfx90a
+         (MI200), gfx942 (MI300). Only used when --with-gpu=amd. Default:
+         "native" (auto-detect the GPU on the build machine); use
+         "rocminfo | grep gfx" to find the code by hand if "native" is not
+         accepted by your compiler version.])],
+    [with_offload_arch=$withval], [with_offload_arch=native])
+
+AC_ARG_WITH([fc-optlevel],
+    [AS_HELP_STRING([--with-fc-optlevel=LEVEL],
+        [Optimization level (0/1/2/3) passed to the Fortran compiler
+         for compiling each file. Default: 3 for NVIDIA, 2 for AMD.
+         The AMD default avoids a known amdflang issue where device
+         kernel symbols can be silently optimized away at -O3 (see
+         llvm/llvm-project issue #61483), causing
+         HSA_STATUS_ERROR_INVALID_SYMBOL_NAME / "requested object was
+         not found in the binary image" at run time; -O2 was not
+         observed to trigger it. This is independent of the separate
+         -O1 forced onto the AMD link step regardless of this setting
+         (see the LDFLAGS comment above in the AMD case) -- that
+         addresses a different bug in amdflang's device-code linking
+         itself, not in compiling individual files, and raising this
+         setting does not affect it. Once your ROCm/amdflang version
+         has the -O3 issue fixed, raise this back and re-verify
+         correctness at production scale before trusting any
+         performance gain.])],
+    [with_fc_optlevel=$withval], [with_fc_optlevel=auto])
+
 # Checks for programs.
 AC_PROG_CPP
-AC_PROG_CC([nvc gcc cc])
+# nvc (NVIDIA HPC SDK's C compiler) is only relevant/available on NVIDIA
+# systems, and on other systems (or if a stray nvc happens to be left on
+# PATH, e.g. from an unrelated module) it can be broken or reference
+# paths that don't exist there. Skip it whenever the environment already
+# points at an AMD toolchain, either via --with-gpu=amd or via FC already
+# naming an AMD compiler (as when a "module load rocm/..." sets FC).
+cc_candidates="nvc gcc cc"
+AS_IF([test "x$with_gpu" = "xamd"], [cc_candidates="gcc clang cc"])
+AS_CASE([$FC],
+        [*amdflang*|*flang-new*|*flang*], [cc_candidates="gcc clang cc"])
+AC_PROG_CC([$cc_candidates])
 AC_PROG_CC_C_O
 AM_PROG_CC_C_O
-AC_PROG_FC([nvfortran])
+# nvfortran: NVIDIA HPC SDK. amdflang / flang-new: AMD's ROCm/LLVM-based
+# Fortran compiler (loaded via e.g. "module load rocm/7.2.0" or one of the
+# "..._amdflang" combo modules). If FC is already set in the environment
+# (as when a module sets it, or the person exports FC=amdflang by hand),
+# that value is used as-is and this candidate list is ignored.
+AC_PROG_FC([nvfortran amdflang flang-new])
 AC_PROG_LN_S
 
 # modified MPI detector (searches mpiifort first)
@@ -132,8 +182,104 @@ AS_IF([test "x$use_mpi" = "xyes"],
 	     FC_CANONICAL="$FC"])
 AC_SUBST([FC_CANONICAL])
 
-# optimization flags
-FCFLAGS="$FCFLAGS -fast -Minfo=accel -acc -cudalib=cufft"
+# optimization / GPU offload flags
+#
+# with_gpu=auto detects the vendor from the (pre-MPI-wrapping) Fortran
+# compiler name recorded in FC_CANONICAL just above. Override with
+# --with-gpu=nvidia / --with-gpu=amd / --with-gpu=none if the name-based
+# guess is wrong (e.g. a custom-named wrapper script).
+AS_IF([test "x$with_gpu" = "xauto"],
+      [AS_CASE([$FC_CANONICAL],
+               [*nvfortran*], [with_gpu=nvidia],
+               [*amdflang*|*flang-new*|*flang*], [with_gpu=amd],
+               [with_gpu=none])])
+
+AC_ARG_WITH([hipfort],
+    [AS_HELP_STRING([--with-hipfort=DIR],
+        [Root directory containing hipfort's AMD ("amdgcn") build, i.e.
+         the directory such that DIR/include/hipfort/amdgcn/hipfort_hipfft.mod
+         and DIR/lib/libhipfort-amdgcn.a both exist. Default: $ROCM_PATH,
+         since ROCm 7.x ships hipfort bundled inside the ROCm tree itself.])],
+    [with_hipfort=$withval], [with_hipfort=auto])
+
+GPU_LIBS=
+AS_CASE([$with_gpu],
+  [nvidia], [dnl
+    AS_IF([test "x$with_fc_optlevel" = "xauto"], [with_fc_optlevel=3])
+    # -acc is kept only for backward compatibility while any file still
+    # has "!$acc" directives; as of this branch every file has been
+    # converted to OpenMP target offload, so -acc is a no-op and can be
+    # dropped once you are sure no OpenACC directives remain anywhere.
+    FCFLAGS="$FCFLAGS -fast -Minfo=accel -mp=gpu -cudalib=cufft"
+  ],
+  [amd], [dnl
+    AS_IF([test "x$with_fc_optlevel" = "xauto"], [with_fc_optlevel=2])
+    # ROCm's ROCM_PATH is normally exported by "module load rocm/x.y.z";
+    # fall back to the conventional /opt/rocm install location otherwise.
+    AS_IF([test "x$ROCM_PATH" = "x"], [ROCM_PATH=/opt/rocm])
+    FCFLAGS="$FCFLAGS -O$with_fc_optlevel -cpp -fopenmp --offload-arch=$with_offload_arch"
+
+    # As of ROCm 7.x, hipfort ships bundled inside the ROCm tree itself
+    # (not as a separate package), with prebuilt .mod files for both the
+    # "amdgcn" (AMD GPU) and "nvptx" (NVIDIA GPU, via hipfort's CUDA
+    # backend) targets side by side:
+    #   $ROCM_PATH/include/hipfort/amdgcn/hipfort_hipfft.mod
+    #   $ROCM_PATH/lib/libhipfort-amdgcn.a
+    # --with-hipfort=DIR overrides the root DIR to search under (still
+    # expecting the same include/hipfort/amdgcn and lib layout below it)
+    # for installations that keep hipfort somewhere else.
+    AS_IF([test "x$with_hipfort" = "xauto"], [with_hipfort=$ROCM_PATH])
+
+    AS_IF([test ! -f "$with_hipfort/include/hipfort/amdgcn/hipfort_hipfft.mod"],
+      [AC_MSG_ERROR([dnl
+Could not find $with_hipfort/include/hipfort/amdgcn/hipfort_hipfft.mod.
+Locate hipfort by hand, e.g.:
+  find $ROCM_PATH -iname "hipfort_hipfft.mod" 2>/dev/null
+  find / -iname "hipfort_hipfft.mod" 2>/dev/null
+then re-run configure with --with-hipfort=DIR, where DIR is the
+directory that contains both "include/hipfort/amdgcn" and "lib".])])
+
+    FCFLAGS="$FCFLAGS -I$with_hipfort/include/hipfort/amdgcn"
+    GPU_LIBS="-L$with_hipfort/lib -lhipfort-amdgcn -lhipfft -lamdhip64"
+
+    # recpcal_energy_refs is built from recpcal_hip.hip.cpp by hipcc
+    # rather than as OpenMP target offload; see that file's header.
+    AC_PATH_PROG([HIPCC], [hipcc], [no], [$ROCM_PATH/bin$PATH_SEPARATOR$PATH])
+    AS_IF([test "x$HIPCC" = "xno"],
+      [AC_MSG_ERROR([dnl
+Could not find hipcc (looked in $ROCM_PATH/bin and on PATH). It is
+needed to build recpcal_hip.hip.cpp for the AMD target.])])
+    HIPCCFLAGS="-O3 --offload-arch=$with_offload_arch"
+    use_hip=yes
+
+    # amdflang's OpenMP-target device-linking step re-optimizes every
+    # translation unit's device code together, and running that step
+    # itself at -O2 was found to silently miscompile at least one
+    # kernel (see recpcal.F90's notes) -- not a crash, just occasional
+    # grossly wrong values that only showed up at production-scale run
+    # lengths -- even when every individual file compiled correctly on
+    # its own at -O2. Compiling everything at -O$with_fc_optlevel but
+    # forcing just the final link step back down to -O1 was sufficient
+    # to fix it and measured faster than building everything at -O1.
+    # A compiler takes the last -O flag it sees, and LDFLAGS is placed
+    # after FCFLAGS on the link line, so appending it here overrides
+    # -O$with_fc_optlevel for linking only, without touching how any
+    # individual file is compiled.
+    LDFLAGS="$LDFLAGS -O1"
+  ],
+  [none], [dnl
+    AC_MSG_WARN([Could not auto-detect a GPU vendor from FC="$FC_CANONICAL". Building without any GPU offload flags. Pass --with-gpu=nvidia or --with-gpu=amd to force a toolchain.])
+  ],
+  [AC_MSG_ERROR([Unknown value for --with-gpu: $with_gpu (expected nvidia, amd, or none)])]
+)
+AC_SUBST([GPU_LIBS])
+AC_SUBST([HIPCC])
+AC_SUBST([HIPCCFLAGS])
+AM_CONDITIONAL([USE_HIP], [test "x$use_hip" = "xyes"])
+# recpcal_hip.hip.cpp switches its real type on -DDP just as
+# precision.F90 does, so it has to see the same flag.
+AS_IF([test "x$enable_double" = "xyes"], [DP_FLAG=-DDP], [DP_FLAG=])
+AC_SUBST([DP_FLAG])
 AC_DEFUN([MY_FC_OPT_ACCEPT_NATIVE],[
 AC_CACHE_CHECK([fortran compiler accepts -march=native],
 my_fc_opt_accept_native_cv_flag,
@@ -157,8 +303,10 @@ AC_OUTPUT
 
 AC_MSG_RESULT([dnl
 MPI: $mpi_result
+GPU vendor: $with_gpu
 FC(for ermod)=$FC
 FCFLAGS=$FCFLAGS
+GPU_LIBS=$GPU_LIBS
 LDFLAGS=$LDFLAGS
 LIBS=$LIBS
 

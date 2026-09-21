@@ -16,6 +16,14 @@
 ! along with this program; if not, write to the Free Software
 ! Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 !
+! =====================================================================
+! OpenMP target offload port (originally OpenACC). setparam (in module
+! setconf) allocates and transfers moltype, numsite, sluvid, charge,
+! ljtype, mol_begin_index, mol_charge, ljlensq_mat and ljene_mat, which
+! realcal.F90 and recpcal.F90's kernels reference via map(alloc: ...).
+! This file has no compute kernels of its own (enter data / update
+! only), so the conversion is purely mechanical.
+! =====================================================================
 !
 ! renaming outside parameters and parameters to avoid conflict
 module OUTname
@@ -617,7 +625,7 @@ contains
     end if
 
     allocate( moltype(nummol), numsite(nummol), sluvid(nummol) )
-    !$acc enter data create(moltype, numsite, sluvid)
+    !$omp target enter data map(alloc: moltype, numsite, sluvid)
 
     ! make mapping from molecule no. [1..nummol] to particle type [1..numtype]
     cmin = 1
@@ -627,16 +635,16 @@ contains
        moltype(cmin:cmax) = pti ! sequential identification
        cmin = cmax + 1
     end do
-    !$acc update device(moltype)
+    !$omp target update to(moltype)
     if (cmax /= nummol) call halt_with_error("set_num")
 
     ! Assign the number of sites within molecule
     numsite(1:nummol) = ptsite( moltype(1:nummol) )
-    !$acc update device(numsite)
+    !$omp target update to(numsite)
 
     ! Build the solute/solvent specification
     sluvid(1:nummol) = pttype( moltype(1:nummol) )
-    !$acc update device(sluvid)
+    !$omp target update to(sluvid)
 
     ! check if all the solute molecules have the same number of atoms
     stmax = -1
@@ -659,7 +667,7 @@ contains
     allocate( mol_begin_index(nummol + 1) )
     allocate( belong_to(numatm) )
     allocate( mol_charge(nummol) )
-    !$acc enter data create(charge, ljtype, mol_begin_index, mol_charge)
+    !$omp target enter data map(alloc: charge, ljtype, mol_begin_index, mol_charge)
 
     ! initial setting to zero
     bfcoord(:,:) = 0.0
@@ -675,7 +683,7 @@ contains
     do i = 1, nummol
        mol_begin_index(i + 1) = mol_begin_index(i) + numsite(i)
     end do
-    !$acc update device(mol_begin_index)
+    !$omp target update to(mol_begin_index)
     if (mol_begin_index(nummol + 1) /= numatm + 1) call halt_with_error("set_bug")
     if (mol_end_index(nummol) /= numatm) call halt_with_error("set_bug")
 
@@ -807,7 +815,7 @@ contains
        read(ljtable_io, *) ljtype_max
        allocate( ljlensq_mat(ljtype_max, ljtype_max), &
             ljene_mat(ljtype_max, ljtype_max) )
-       !$acc enter data create(ljlensq_mat, ljene_mat)
+       !$omp target enter data map(alloc: ljlensq_mat, ljene_mat)
        do i = 1, ljtype_max
           read (ljtable_io, *) ljlensq_mat(i, 1:ljtype_max)
           ljlensq_mat(i, 1:ljtype_max) = ljlensq_mat(i, 1:ljtype_max) ** 2
@@ -820,7 +828,7 @@ contains
        ! From LJ data
        allocate( ljlensq_mat(ljtype_max, ljtype_max), &
             ljene_mat(ljtype_max, ljtype_max) )
-       !$acc enter data create(ljlensq_mat, ljene_mat)
+       !$omp target enter data map(alloc: ljlensq_mat, ljene_mat)
        do i = 1, ljtype_max
           select case(cmbrule)
           case(LJCMB_ARITH)    ! arithmetic mean
@@ -836,20 +844,20 @@ contains
                                            * ljene_temp_table(i) )
        end do
     endif
-    !$acc update device(ljlensq_mat, ljene_mat)
+    !$omp target update to(ljlensq_mat, ljene_mat)
     deallocate( ljlen_temp_table, ljene_temp_table )
 
 
     ! conversion to (kcal/mol angstrom)^(1/2)
     ! == sqrt(e^2 * coulomb const * avogadro / (kcal / mol angstrom))
     charge(1:numatm) = 18.22261721 * charge(1:numatm)
-    !$acc update device(charge, ljtype)
+    !$omp target update to(charge, ljtype)
 
     ! get molecule-wise charges
     do i = 1, nummol
        mol_charge(i) = sum( charge(mol_begin_index(i):mol_end_index(i)) )
     end do
-    !$acc update device(mol_charge)
+    !$omp target update to(mol_charge)
 
     ! Is every solute atom's charge exactly zero? If so, the reciprocal-
     ! space (PME/PPPM) calculation for the solute is provably a no-op and

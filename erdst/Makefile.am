@@ -36,7 +36,7 @@ CLEANFILES = *.mod
 erdst_SOURCES = $(ersources)
 AM_CFLAGS = -DINSTALL_PLUGIN_PATH=\"$(pkglibexecdir)\"
 AM_FCFLAGS = $(VMDPLUGINFLAGS)
-erdst_LDADD = $(LAPACK_LIBS) $(BLAS_LIBS) $(MPILIBS) -ldl -lm
+erdst_LDADD = $(LAPACK_LIBS) $(BLAS_LIBS) $(MPILIBS) $(GPU_LIBS) -ldl -lm
 
 if USE_VMDPLUGIN
 erdst_SOURCES += vmdfio.c
@@ -89,7 +89,6 @@ $(top_builddir)/insertion.$(OBJEXT): $(top_srcdir)/insertion.F90 \
     $(top_builddir)/trajectory.$(OBJEXT) \
     $(top_builddir)/mpiproc.$(OBJEXT) \
     $(top_builddir)/engmain.$(OBJEXT)
-$(top_builddir)/randgen.$(OBJEXT): $(top_srcdir)/randgen.F90
 $(top_builddir)/setconf.$(OBJEXT): $(top_srcdir)/setconf.F90 \
     $(top_builddir)/utility.$(OBJEXT) \
     $(top_builddir)/trajectory.$(OBJEXT) \

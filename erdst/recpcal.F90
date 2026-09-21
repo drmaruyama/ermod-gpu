@@ -16,12 +16,110 @@
 ! along with this program; if not, write to the Free Software
 ! Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
+! =====================================================================
+! OpenMP target offload port (originally OpenACC). This module owns
+! its device data (slvtag, splslv, grdslv, cnvslt, engfac, rcpslt) end
+! to end, so it does not rely on the OpenACC/OpenMP interop noted in
+! realcal.F90 for those arrays -- only for cross-module ones from
+! engmain (mol_begin_index, charge, numsite, sluvid) and the caller
+! (uvengy, tagpt, sltlist).
+!
+! IMPORTANT, general rule learned the hard way in this file and in
+! realcal.F90: amdflang (tested at ROCm 7.2) does not reliably
+! auto-privatize scalars assigned inside a "!$omp target teams
+! distribute" region's loop body, even without a "collapse" clause and
+! even when the scalar is only ever assigned once per outer iteration
+! (see recpcal_energy_soln's outer distribute loop, where tagslt, i,
+! svi, stmax and pairep -- each set once per (cnt,k) "team" -- were
+! originally left off the private clause and produced a silently,
+! systematically wrong answer, not a crash, not affected by the RNG,
+! and not caught by small-scale testing). Every scalar assigned in the
+! body of any "!$omp target teams distribute" or "!$omp target teams
+! distribute parallel do" region in this file must be listed in an
+! explicit "private(...)" clause; do not rely on this toolchain's
+! implicit default, and re-verify at production scale (against the
+! NVIDIA/OpenACC reference) after any change here.
+!
+! "!$acc loop seq" (the cg1 loop in recpcal_energy_soln/refs) has no
+! OpenMP equivalent; a loop with no directive already runs sequentially
+! within the thread that owns the enclosing parallel iteration, so the
+! directive is simply omitted there.
+!
+! splval and grdval (the per-molecule B-spline coefficients computed on
+! the host just before each kernel launch) are mapped explicitly with
+! "map(to: ...)" in recpcal_prepare_solute(_refs), since they are
+! read-only on the device; leaving them off the map clause causes an
+! implicit "map(tofrom:...)", which copies them back to the host
+! unnecessarily on every call.
+!
+! recpcal_energy_soln's "(cnt,k)" parallelism is only slvmax-wide when
+! maxdst=1 (i.e. for soln), which rocprof-compute measured as using
+! only ~18 of MI300A's 228 compute units. Two things were tried and
+! rejected before the current form: (1) restructuring it as a bare
+! "!$omp target teams distribute" (one team per (cnt,k)) with a nested
+! "!$omp parallel do collapse(3) reduction(+:pairep)" inside ran ~44%
+! faster but produced systematically wrong energies -- reproducibly
+! wrong, identical across runs, so a codegen problem rather than a
+! race -- even with every loop-body scalar explicitly privatized in
+! both directives, so that nested form appears not to be handled
+! correctly by this amdflang version; (2) keeping the plain
+! collapse(2) but stating num_teams/thread_limit explicitly was either
+! much slower (thread_limit(256), which leaves most of each team idle
+! given only ~slvmax iterations to hand out) or no better than letting
+! the compiler choose (thread_limit(64)). The kernel now collapses the
+! solvent molecule's own site loop "sid" into the parallel iteration
+! space as well and accumulates each thread's partial sum into uvengy
+! with an atomic update -- the same pattern realcal.F90 uses. Since
+! solvent species can differ in size (mixed solvents are supported),
+! "sid" runs to slv_maxsite (see recpcal_init) and iterations past a
+! given molecule's own numsite are skipped.
+!
+! recpcal_energy_refs was left on the plain collapse(2) form. The same
+! collapsed-"sid" + atomic change was tried there and measured no
+! faster (within run-to-run noise): (cnt,i) alone already reaches ~97%
+! CU occupancy there, so there is no occupancy to gain, and while that
+! kernel is memory-latency-bound (~1% of peak IPC at very high
+! occupancy), shortening each thread's sequential chain did not buy
+! anything either.
+!
+! The charge-spreading kernel in recpcal_prepare_solute(_refs) collapses
+! "sid" (the solute's own sites, typically under 10) together with all
+! three spline-order loops "cg3"/"cg2"/"cg1" (each typically 4-6) to
+! give the GPU roughly stmax*splodr**3 independent units of work
+! instead of just stmax; profiling on MI300A showed the "sid"-only
+! version left most of the device's compute units idle. Repeated timing
+! (single runs are noisy on this system) confirmed collapse(4) is the
+! fastest configuration measured, ahead of collapse(3) and collapse(2).
+!
+! IMPORTANT: under collapse(4), amdflang (tested at -O1, ROCm 7.2)
+! failed to correctly privatize the loop-body scalars ati, chr, rc1,
+! rc2, rc3 and factor -- multiple GPU threads ended up sharing them,
+! producing occasional grossly wrong values that only showed up at
+! production-scale insertion counts (rare enough to pass small-scale
+! testing repeatedly). Per the OpenMP standard these scalars should
+! already be (implicitly) private without any clause, so this is a
+! compiler conformance gap for this collapse level, not a style choice;
+! the explicit "private(...)" clause below works around it and was
+! re-verified correct at production scale against the NVIDIA/OpenACC
+! reference. At -O2, the same miscompilation reappears even with this
+! explicit private clause (and disabling the openmp-opt pass does not
+! help), so this file must be built at -O1 (see configure.ac's
+! --with-fc-optlevel) until a fixed amdflang/ROCm toolchain is
+! available; re-verify at production scale before ever raising it.
+!
+! The atomic contention on cnvslt itself (from different solute atoms'
+! B-spline support overlapping on the same grid point) is inherent to
+! the charge-assignment algorithm and is unrelated to the above bug.
+! =====================================================================
+
 module reciprocal
   use precision_kinds, only: wp
   use fft_iface, only: fft_handle
   implicit none
   integer :: rc1min, rc1max, rc2min, rc2max, rc3min, rc3max
   integer :: ccesize, ccemax
+  ! largest numsite() over the solvent molecules; see recpcal_init
+  integer :: slv_maxsite = 0
   integer, allocatable :: slvtag(:)
   real(wp),    allocatable :: engfac(:,:,:)
   real(wp),    allocatable :: gf_b(:)
@@ -53,15 +151,24 @@ contains
     integer :: gridsize(3), ptrnk
 
     allocate( slvtag(nummol) )
-    !$acc enter data create(slvtag)
+    !$omp target enter data map(alloc: slvtag)
     slvtag(:) = -1
     ptrnk = 0
+    slv_maxsite = 0
     do k = 1, slvmax
        m = tagpt(k)
        slvtag(m) = ptrnk + 1
        ptrnk = ptrnk + numsite(m)
+       ! Largest site count over all solvent molecules. recpcal_energy_soln
+       ! collapses its "sid" loop into the parallel iteration space, which
+       ! requires a trip count that does not depend on which molecule is
+       ! being processed; it runs sid = 1..slv_maxsite and skips the
+       ! iterations past that molecule's own numsite. Solvent species may
+       ! differ in size (mixed solvents are supported), so this is a
+       ! maximum rather than a common value.
+       if (numsite(m) > slv_maxsite) slv_maxsite = numsite(m)
     enddo
-    !$acc update device(slvtag)
+    !$omp target update to(slvtag)
 
     allocate(gf_b(splodr)) ! for PPPM Green's function
     call calc_gfb_pppm()   ! calc gf_b (function of splodr)
@@ -71,7 +178,7 @@ contains
     ccesize = ms1max / 2 + 1; ccemax = ccesize - 1
     call spline_init(splodr)
     allocate(splslv(0:splodr-1, 3, ptrnk), grdslv(3, ptrnk))
-    !$acc enter data create(splslv, grdslv)
+    !$omp target enter data map(alloc: splslv, grdslv)
     ! One reciprocal-space grid per "slot" (solute molecule for
     ! SLT_SOLN, insertion trial for SLT_REFS_*), so each can be
     ! spread/FFT'd/evaluated without clobbering the others (see
@@ -83,7 +190,7 @@ contains
        allocate(solute_self_energy(maxins))
        allocate(cnvslt(rc1min:rc1max, rc2min:rc2max, rc3min:rc3max, maxins))
     end if
-    !$acc enter data create(cnvslt)
+    !$omp target enter data map(alloc: cnvslt)
     ! initialize spline table for all axes
     allocate( splfc1(rc1min: rc1max) )
     allocate( splfc2(rc2min: rc2max) )
@@ -97,11 +204,12 @@ contains
     call fft_set_size(gridsize)
     allocate( engfac(rc1min:ccemax, rc2min:rc2max, rc3min:rc3max) )
     allocate( rcpslt(rc1min:ccemax, rc2min:rc2max, rc3min:rc3max) )
-    !$acc enter data create(engfac, rcpslt)
+    !$omp target enter data map(alloc: engfac, rcpslt)
     ! init fft (each grid slice has the same shape; slice 1 always exists)
     call fft_init_rtc(handle_r2c, cnvslt(:,:,:,1), rcpslt)
     call fft_init_ctr(handle_c2r, rcpslt, cnvslt(:,:,:,1))
   end subroutine recpcal_init
+
 
   subroutine init_spline_axis(imin, imax, splfc)
     use engmain, only: splodr, PI
@@ -175,7 +283,7 @@ contains
        end do
     end do
     engfac(0, 0, 0) = 0.0
-    !$acc update device(engfac)
+    !$omp target update to(engfac)
   end subroutine recpcal_spline_greenfunc
 
   ! implemented only for PPPM
@@ -349,7 +457,7 @@ contains
        end do
     end do
     engfac(0, 0, 0) = 0.0
-    !$acc update device(engfac)
+    !$omp target update to(engfac)
   end subroutine recpcal_pppm_greenfunc
 
   ! note: this routine is named as "solvent", but may include solute molecule, when mutiple solute is used.
@@ -369,7 +477,7 @@ contains
        call calc_spline_molecule(i, stmax, splslv(:,:,svi:svi+stmax-1), &
             grdslv(:,svi:svi+stmax-1))
     end do
-    !$acc update device(splslv, grdslv)
+    !$omp target update to(splslv, grdslv)
   end subroutine recpcal_prepare_solvent
 
   subroutine recpcal_prepare_solute(sltlist, maxdst)
@@ -395,7 +503,7 @@ contains
        initialized = .true.
     end if
     ms1max_even = (mod(ms1max, 2) == 0)
-    !$acc parallel loop collapse(4) gang vector present(cnvslt)
+    !$omp target teams distribute parallel do collapse(4) map(alloc: cnvslt)
     do cnt = 1, maxdst
        do k = rc3min, rc3max
           do j = rc2min, rc2max
@@ -405,31 +513,34 @@ contains
           end do
        end do
     end do
-    !$acc end parallel
+    !$omp end target teams distribute parallel do
     do cnt = 1, maxdst
        tagslt = sltlist(cnt)
 
        call calc_spline_molecule(tagslt, stmax, splval(:,:,1:stmax), grdval(:,1:stmax))
-       !$acc parallel loop present(mol_begin_index, charge, cnvslt, rcpslt)
+       !$omp target teams distribute parallel do collapse(4) &
+       !$omp&   private(ati, chr, rc1, rc2, rc3, factor) &
+       !$omp&   map(to: splval, grdval) &
+       !$omp&   map(alloc: mol_begin_index, charge, cnvslt, rcpslt)
        do sid = 1, stmax
-!         ati = specatm(sid, tagslt)
-          ati = mol_begin_index(tagslt) + (sid - 1)
-          chr = charge(ati)
           do cg3 = 0, splodr - 1
              do cg2 = 0, splodr - 1
                 do cg1 = 0, splodr - 1
+!         ati = specatm(sid, tagslt)
+                   ati = mol_begin_index(tagslt) + (sid - 1)
+                   chr = charge(ati)
                    rc1 = modulo(grdval(1, sid) - cg1, ms1max)
                    rc2 = modulo(grdval(2, sid) - cg2, ms2max)
                    rc3 = modulo(grdval(3, sid) - cg3, ms3max)
                    factor = chr * splval(cg1, 1, sid) * splval(cg2, 2, sid) &
                         * splval(cg3, 3, sid)
-                   !$acc atomic update
+                   !$omp atomic update
                    cnvslt(rc1, rc2, rc3, cnt) = cnvslt(rc1, rc2, rc3, cnt) + factor
                 end do
              end do
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
 
        call fft_rtc(handle_r2c, cnvslt(:,:,:,cnt), rcpslt)                 ! 3D-FFT
 
@@ -444,7 +555,8 @@ contains
        ! plane gets full weight, except rc1==0 (and rc1==ccemax when
        ! ms1max is even), which get half weight.
        self_energy = 0.0_wp
-       !$acc parallel loop collapse(3) reduction(+:self_energy) present(engfac, rcpslt)
+       !$omp target teams distribute parallel do collapse(3) reduction(+:self_energy) &
+       !$omp&   map(alloc: engfac, rcpslt)
        do k = rc3min, rc3max
           do j = rc2min, rc2max
              do i = rc1min, ccemax
@@ -458,21 +570,11 @@ contains
              end do
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
        solute_self_energy(cnt) = self_energy
 
-       ! NOTE: this used to be written as a triple "do concurrent" under
-       ! "!$acc parallel loop". With the "parallel" construct, nvfortran
-       ! does not distribute a multi-index do-concurrent across gangs; it
-       ! only vectorizes one of the three indices and runs the other two
-       ! sequentially inside each vector lane (confirmed against nvfortran
-       ! 26.1; see NVIDIA developer forum thread 361662). That silently
-       ! collapses the whole ccemax x rc2 x rc3 volume onto a single
-       ! thread block, which is a severe (if easy to miss) slowdown, not
-       ! a correctness problem. Explicit nested loops with an explicit
-       ! collapse/gang/vector clause -- the same style used elsewhere in
-       ! this file -- get full gang+vector parallelism instead.
-       !$acc parallel loop collapse(3) gang vector present (engfac, rcpslt)
+       ! see the comment at the equivalent loop in recpcal_prepare_solute_refs
+       !$omp target teams distribute parallel do collapse(3) map(alloc: engfac, rcpslt)
        do k = rc3min, rc3max
           do j = rc2min, rc2max
              do i = rc1min, ccemax
@@ -480,7 +582,7 @@ contains
              end do
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
 
        call fft_ctr(handle_c2r, rcpslt, cnvslt(:,:,:,cnt))                    ! 3D-FFT
 
@@ -507,7 +609,7 @@ contains
        initialized = .true.
     end if
     ms1max_even = (mod(ms1max, 2) == 0)
-    !$acc parallel loop collapse(4) gang vector present(cnvslt)
+    !$omp target teams distribute parallel do collapse(4) map(alloc: cnvslt)
     do cnt = 1, maxdst
        do k = rc3min, rc3max
           do j = rc2min, rc2max
@@ -517,32 +619,36 @@ contains
           end do
        end do
     end do
-    !$acc end parallel
+    !$omp end target teams distribute parallel do
     do cnt = 1, maxdst
 
        call calc_spline_molecule_refs(tagslt, cnt, stmax, &
             splval(:,:,1:stmax), grdval(:,1:stmax))
-       !$acc parallel loop present(mol_begin_index, charge, cnvslt, rcpslt)
+
+       !$omp target teams distribute parallel do collapse(4) &
+       !$omp&   private(ati, chr, rc1, rc2, rc3, factor) &
+       !$omp&   map(to: splval, grdval) &
+       !$omp&   map(alloc: mol_begin_index, charge, cnvslt, rcpslt)
        do sid = 1, stmax
-          ! ati = specatm(sid, tagslt)
-          ati = mol_begin_index(tagslt) + (sid - 1)
-          chr = charge(ati)
           do cg3 = 0, splodr - 1
              do cg2 = 0, splodr - 1
                 do cg1 = 0, splodr - 1
+                   ! ati = specatm(sid, tagslt)
+                   ati = mol_begin_index(tagslt) + (sid - 1)
+                   chr = charge(ati)
                    rc1 = modulo(grdval(1, sid) - cg1, ms1max)
                    rc2 = modulo(grdval(2, sid) - cg2, ms2max)
                    rc3 = modulo(grdval(3, sid) - cg3, ms3max)
                    factor = chr * splval(cg1, 1, sid) * splval(cg2, 2, sid) &
                         * splval(cg3, 3, sid)
-                   !$acc atomic update
+                   !$omp atomic update
                    cnvslt(rc1, rc2, rc3, cnt) = &
                         cnvslt(rc1, rc2, rc3, cnt) + factor
                 end do
              end do
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
 
        call fft_rtc(handle_r2c, cnvslt(:,:,:,cnt), rcpslt)
 
@@ -552,7 +658,8 @@ contains
        ! of syncing rcpslt back to the host on every one of the
        ! (potentially thousands of) insertion trials in this loop.
        self_energy = 0.0_wp
-       !$acc parallel loop collapse(3) reduction(+:self_energy) present(engfac, rcpslt)
+       !$omp target teams distribute parallel do collapse(3) reduction(+:self_energy) &
+       !$omp&   map(alloc: engfac, rcpslt)
        do k = rc3min, rc3max
           do j = rc2min, rc2max
              do i = rc1min, ccemax
@@ -566,11 +673,11 @@ contains
              end do
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
        solute_self_energy(cnt) = self_energy
 
        ! see the comment at the equivalent loop in recpcal_prepare_solute
-       !$acc parallel loop collapse(3) gang vector present (engfac, rcpslt)
+       !$omp target teams distribute parallel do collapse(3) map(alloc: engfac, rcpslt)
        do k = rc3min, rc3max
           do j = rc2min, rc2max
              do i = rc1min, ccemax
@@ -578,7 +685,7 @@ contains
              end do
           end do
        end do
-       !$acc end parallel
+       !$omp end target teams distribute parallel do
 
        call fft_ctr(handle_c2r, rcpslt, cnvslt(:,:,:,cnt))
 
@@ -683,50 +790,67 @@ contains
     real(wp) :: fac1, fac2, fac3, chr
     integer :: grid1
 
-    !$acc parallel loop collapse(2) present(uvengy, mol_begin_index, tagpt, sltlist, charge, numsite, sluvid, slvtag, splslv, grdslv, cnvslt)
+    ! [並列度の拡大] maxdst=1 (soln) では (cnt,k) だけの並列化は実質
+    ! slvmax 個の反復しか生まず、MI300A の 228基あるCUのうち一部しか
+    ! 使われないことが rocprof-compute の実測 (Active CUs ~18/228) で
+    ! 確認された。そこで溶媒分子内のサイト "sid" も collapse に含めて
+    ! 並列度を slvmax*slv_maxsite 倍に広げ、各スレッドの部分和を
+    ! atomic update で uvengy に足し込む形にしている(realcal.F90 が
+    ! 既に使っているパターン)。sid のループ回数は分子によらず一定で
+    ! ある必要があるため、全溶媒分子中の最大サイト数 slv_maxsite まで
+    ! 回し、その分子に存在しないサイトはスキップする(混合溶媒では
+    ! 分子ごとにサイト数が異なるため)。
+    !$omp target teams distribute parallel do collapse(3) &
+    !$omp&   private(tagslt, i, svi, stmax, pairep, cg1, cg2, cg3, &
+    !$omp&           ptrnk, ati, chr, fac1, fac2, fac3, rc1, rc2, rc3, grid1) &
+    !$omp&   map(alloc: uvengy, mol_begin_index, tagpt, sltlist, charge, numsite, sluvid, slvtag, splslv, grdslv, cnvslt)
     do cnt = 1, maxdst
     do k = 1, slvmax
+    do sid = 1, slv_maxsite
        tagslt = sltlist(cnt)
        i = tagpt(k)
        if (i == tagslt) cycle
 
-       pairep = 0.0_wp
        svi = slvtag(i)
        if (svi <= 0) stop  ! call halt_with_error('rcp_cns')
        stmax = numsite(i)
-       do sid = 1, stmax
-          ptrnk = svi + sid - 1
-          ati = mol_begin_index(i) + (sid - 1) ! = specatm(sid, i)
-          chr = charge(ati)
-          do cg3 = 0, splodr - 1
-             fac1 = chr * splslv(cg3, 3, ptrnk)
-             rc3 = modulo(grdslv(3, ptrnk) - cg3, ms3max)
-             do cg2 = 0, splodr - 1
-                fac2 = fac1 * splslv(cg2, 2, ptrnk)
-                rc2 = modulo(grdslv(2, ptrnk) - cg2, ms2max)
-                grid1 = grdslv(1, ptrnk)
-                if (grid1 >= splodr-1 .and. grid1 < ms1max) then
-                   !$acc loop seq
-                   do cg1 = 0, splodr - 1
-                      fac3 = fac2 * splslv(cg1, 1, ptrnk)
-                      rc1 = grid1 - cg1
-                      pairep = pairep + fac3 * cnvslt(rc1, rc2, rc3, cnt)
-                   enddo
-                else
-                   !$acc loop seq
-                   do cg1 = 0, splodr - 1
-                      fac3 = fac2 * splslv(cg1, 1, ptrnk)
-                      rc1 = mod(grid1 + ms1max - cg1, ms1max) ! speedhack
-                      pairep = pairep + fac3 * cnvslt(rc1, rc2, rc3, cnt)
-                   end do
-                endif
-             end do
+       if (sid > stmax) cycle   ! this molecule has no such site
+
+       pairep = 0.0_wp
+       ptrnk = svi + sid - 1
+       ati = mol_begin_index(i) + (sid - 1) ! = specatm(sid, i)
+       chr = charge(ati)
+       do cg3 = 0, splodr - 1
+          fac1 = chr * splslv(cg3, 3, ptrnk)
+          rc3 = modulo(grdslv(3, ptrnk) - cg3, ms3max)
+          do cg2 = 0, splodr - 1
+             fac2 = fac1 * splslv(cg2, 2, ptrnk)
+             rc2 = modulo(grdslv(2, ptrnk) - cg2, ms2max)
+             grid1 = grdslv(1, ptrnk)
+             if (grid1 >= splodr-1 .and. grid1 < ms1max) then
+                ! "!$acc loop seq" had no OpenMP equivalent; a loop with
+                ! no directive is already executed sequentially by the
+                ! thread that owns this (cnt, k, sid) iteration.
+                do cg1 = 0, splodr - 1
+                   fac3 = fac2 * splslv(cg1, 1, ptrnk)
+                   rc1 = grid1 - cg1
+                   pairep = pairep + fac3 * cnvslt(rc1, rc2, rc3, cnt)
+                enddo
+             else
+                do cg1 = 0, splodr - 1
+                   fac3 = fac2 * splslv(cg1, 1, ptrnk)
+                   rc1 = mod(grid1 + ms1max - cg1, ms1max) ! speedhack
+                   pairep = pairep + fac3 * cnvslt(rc1, rc2, rc3, cnt)
+                end do
+             endif
           end do
        end do
+       !$omp atomic update
        uvengy(k, cnt) = uvengy(k, cnt) + pairep
     end do
     end do
-    !$acc end parallel
+    end do
+    !$omp end target teams distribute parallel do
   end subroutine recpcal_energy_soln
 
   subroutine recpcal_energy_refs(tagslt, maxdst, slvmax, uvengy)
@@ -737,15 +861,23 @@ contains
     real(wp), intent(inout) :: uvengy(:, :)
 
     real(wp) :: pairep
-    integer :: cg1, cg2, cg3, i, k, cnt
+    integer :: cg1, cg2, cg3, i, cnt
     integer :: rc1, rc2, rc3, ptrnk, sid, ati, svi, stmax
-    real(wp) :: fac1, fac2, fac3, chr
+    real(wp) :: fac, chr
     integer :: grid1
-    complex(wp) :: rcpt
 
     if (sluvid(tagslt) == 0) stop  ! call halt_with_error('rcp_fst')
 
-    !$acc parallel loop collapse(2) present(uvengy, mol_begin_index, charge, numsite, sluvid, slvtag, splslv, grdslv, cnvslt)
+    ! NOTE: the collapsed-"sid" + atomic form used in
+    ! recpcal_energy_soln was tried here too and measured no faster
+    ! (14m38s vs 14m25s, i.e. within run-to-run noise), so it was
+    ! reverted: the extra parallelism buys nothing here, while the
+    ! atomic update it requires would add contention at ~slvmax*maxdst
+    ! separate uvengy elements for no return.
+    !$omp target teams distribute parallel do collapse(2) &
+    !$omp&   private(svi, stmax, pairep, sid, cg1, cg2, cg3, &
+    !$omp&           ptrnk, ati, chr, fac, rc1, rc2, rc3, grid1) &
+    !$omp&   map(alloc: uvengy, mol_begin_index, charge, numsite, sluvid, slvtag, splslv, grdslv, cnvslt)
     do cnt = 1, maxdst
     do i = 1, slvmax
 
@@ -758,27 +890,31 @@ contains
           ati = mol_begin_index(i) + (sid - 1) ! = specatm(sid, i)
           chr = charge(ati)
           do cg3 = 0, splodr - 1
-             fac1 = chr * splslv(cg3, 3, ptrnk)
              rc3 = modulo(grdslv(3, ptrnk) - cg3, ms3max)
              do cg2 = 0, splodr - 1
-                fac2 = fac1 * splslv(cg2, 2, ptrnk)
+                ! [VGPR削減] このカーネルは vgpr_count=210 とレジスタを
+                ! 大量に使っており、1 SIMD あたり同時に載る wavefront が
+                ! 2 程度に制限されて(512/210)、高いメモリレイテンシ
+                ! (L2-Fabric ~1148 cycles)を隠せず IPC が 1% 程度まで
+                ! 落ちていることが rocprof-compute で確認された。段階的な
+                ! 中間変数 fac1/fac2/fac3 を単一の fac にまとめ、同時に
+                ! 生きているスカラーの数を減らしている。
+                fac = chr * splslv(cg3, 3, ptrnk) * splslv(cg2, 2, ptrnk)
                 rc2 = modulo(grdslv(2, ptrnk) - cg2, ms2max)
                 grid1 = grdslv(1, ptrnk)
                 if (grid1 >= splodr-1 .and. grid1 < ms1max) then
-                   !$acc loop seq
+                   ! see recpcal_energy_soln: no directive needed here,
+                   ! this loop already runs sequentially within its thread.
                    do cg1 = 0, splodr - 1
-                      fac3 = fac2 * splslv(cg1, 1, ptrnk)
                       rc1 = grid1 - cg1
                       pairep = pairep &
-                           + fac3 * cnvslt(rc1, rc2, rc3, cnt)
+                           + fac * splslv(cg1, 1, ptrnk) * cnvslt(rc1, rc2, rc3, cnt)
                    enddo
                 else
-                   !$acc loop seq
                    do cg1 = 0, splodr - 1
-                      fac3 = fac2 * splslv(cg1, 1, ptrnk)
                       rc1 = mod(grid1 + ms1max - cg1, ms1max) ! speedhack
                       pairep = pairep &
-                           + fac3 * cnvslt(rc1, rc2, rc3, cnt)
+                           + fac * splslv(cg1, 1, ptrnk) * cnvslt(rc1, rc2, rc3, cnt)
                    end do
                 endif
              end do
@@ -787,7 +923,9 @@ contains
        uvengy(i, cnt) = uvengy(i, cnt) + pairep
     end do
     end do
-    !$acc end parallel
+    !$omp end target teams distribute parallel do
   end subroutine recpcal_energy_refs
+
+
 
 end module reciprocal

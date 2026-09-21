@@ -16,6 +16,41 @@
 ! along with this program; if not, write to the Free Software
 ! Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
+! =====================================================================
+! OpenMP target offload port (originally OpenACC; see recpcal.F90 for
+! the reciprocal-space / FFT side of the calculation).
+!
+! Notes on this port:
+! - realcal_bare and realcal_bare_refs (cltype = 0, "bare" Coulomb) map
+!   ljtype, ljene_mat and ljlensq_mat explicitly; without that, an
+!   allocatable array referenced but not listed in the map clause can
+!   trigger a device memory access fault under this OpenMP toolchain.
+! - Every scalar assigned inside the four kernels' loop bodies is listed
+!   explicitly in a "private(...)" clause, not left to OpenMP's implicit
+!   firstprivate. This IS necessary with amdflang (ROCm 7.2): removing
+!   the explicit list was tried, and while soln still came out right,
+!   refs produced wrong numbers at production scale. Leave it in.
+! - The separation vector is held in three scalars (xst1, xst2, xst3)
+!   rather than an array xst(3). A per-thread private array tends to
+!   be placed in scratch memory (effectively global memory) on the GPU,
+!   while scalars can stay in registers. Dropping private(xst) outright
+!   made soln about 9% faster, but that leaves xst shared between
+!   threads -- a data race that merely happened not to show in that
+!   test -- so the speedup is pursued this way instead, keeping every
+!   per-thread value properly private.
+! - The loop over the solute's own sites ("is") is deliberately kept
+!   out of the "collapse" clause in all four kernels: each thread sums
+!   its contribution locally and does a single atomic update of uvengy
+!   per (solvent, frame) pair, rather than one atomic per site.
+! - Do not assume a kernel here is correct merely because it runs
+!   correctly on a small/short test case: rerun the full verification
+!   (matched insertion sequence against the NVIDIA/OpenACC reference,
+!   at production scale) after any change to a "!$omp target teams
+!   distribute parallel do" directive in this file, including changes
+!   to which variables are private vs. mapped and changes to the
+!   optimization level it is built at.
+! =====================================================================
+
 module realcal
   use precision_kinds, only: wp
   implicit none
@@ -35,7 +70,7 @@ contains
 
     if (.not. initialized) then
        allocate(sitepos_normal(3, numatm_ext))
-       !$acc enter data create(sitepos_normal)
+       !$omp target enter data map(alloc: sitepos_normal)
        initialized = .true.
     end if
 
@@ -45,7 +80,7 @@ contains
     else
        sitepos_normal(:, :) = sitepos(:, :)
     end if
-    !$acc update device(sitepos_normal)
+    !$omp target update to(sitepos_normal)
   end subroutine realcal_prepare
 
   ! Calculate i-j interaction energy on GPU
@@ -61,7 +96,11 @@ contains
 
     integer :: i, k, is, js, ismax, jsmax, ati, atj, cnt, tagslt
     real(wp) :: reelcut, pairep, rst, dis2, invr2, invr3, invr6
-    real(wp) :: eplj, epcl, xst(3), half_cell(3)
+    real(wp) :: eplj, epcl, half_cell(3)
+    ! separation vector as three scalars rather than an array xst(3):
+    ! a per-thread private array tends to be placed in scratch (i.e.
+    ! global) memory on the GPU, while scalars can live in registers
+    real(wp) :: xst1, xst2, xst3, sh
     real(wp) :: lwljcut2, upljcut2
     real(wp), save :: lwljcut3, upljcut3, lwljcut6, upljcut6
     real(wp) :: ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac
@@ -99,16 +138,22 @@ contains
     ! in sltlist(1:maxdst) has the same topology; ismax does not vary
     ! with cnt.
     ismax = numsite(sltlist(1))
-    !$acc data copyin(half_cell, cell_normal, invcell_normal)
-    !$acc parallel loop collapse(3) gang vector private(xst) present(uvengy, mol_begin_index, tagpt, sltlist, sitepos_normal, ljlensq_mat, ljene_mat, charge, ljtype, numsite)
+    !$omp target data map(to: half_cell, cell_normal, invcell_normal)
+    !$omp target teams distribute parallel do collapse(2) &
+    !$omp&   private(xst1, xst2, xst3, sh, tagslt, i, is, js, ati, atj, ljtype_i, ljtype_j, &
+    !$omp&           pairep, rst, dis2, invr2, invr3, invr6, eplj, epcl, &
+    !$omp&           ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac, &
+    !$omp&           lwljcut2, upljcut2) &
+    !$omp&   map(alloc: uvengy, mol_begin_index, tagpt, sltlist, sitepos_normal, ljlensq_mat, ljene_mat, charge, ljtype, numsite)
     do cnt = 1, maxdst
        do k = 1, slvmax
-          do is = 1, ismax
-             tagslt = sltlist(cnt)
-             i = tagpt(k)
-             if (i == tagslt) cycle
+          ! is kept sequential; see the note at the top of the file.
+          tagslt = sltlist(cnt)
+          i = tagpt(k)
+          if (i == tagslt) cycle
 
-             pairep = 0.0
+          pairep = 0.0
+          do is = 1, ismax
              do js = 1, numsite(i)
 !             ati = specatm(is, tagslt)
 !             atj = specatm(js, i)
@@ -116,22 +161,35 @@ contains
                 atj = mol_begin_index(i) + (js - 1)
                 ljtype_i = ljtype(ati)
                 ljtype_j = ljtype(atj)
-                xst(:) = sitepos_normal(:,ati) - sitepos_normal(:,atj)
-                if (boxshp == SYS_PERIODIC) then    ! when the system is periodic
+                xst1 = sitepos_normal(1,ati) - sitepos_normal(1,atj)
+                xst2 = sitepos_normal(2,ati) - sitepos_normal(2,atj)
+                xst3 = sitepos_normal(3,ati) - sitepos_normal(3,atj)
+                if (boxshp == SYS_PERIODIC) then  ! when the system is periodic
                    if (is_cuboid) then
-                      xst(:) = half_cell(:) - abs(half_cell(:) - abs(xst(:)))
+                      xst1 = half_cell(1) - abs(half_cell(1) - abs(xst1))
+                      xst2 = half_cell(2) - abs(half_cell(2) - abs(xst2))
+                      xst3 = half_cell(3) - abs(half_cell(3) - abs(xst3))
                    else
                       ! Note some ops can be skipped because cell_normal
-                      ! is upper triangular
-                      xst(:) = xst(:) - cell_normal(:, 3) &
-                           * anint(xst(3) * invcell_normal(3))
-                      xst(:) = xst(:) - cell_normal(:, 2) &
-                           * anint(xst(2) * invcell_normal(2))
-                      xst(:) = xst(:) - cell_normal(:, 1) &
-                           * anint(xst(1) * invcell_normal(1))
+                      ! is upper triangular. Each step's shift is taken from
+                      ! the component *before* that step modifies it, which is
+                      ! what the array form xst(:) = xst(:) - c(:,n)*anint(xst(n)*..)
+                      ! did implicitly (Fortran evaluates the whole right side first).
+                      sh = anint(xst3 * invcell_normal(3))
+                      xst1 = xst1 - cell_normal(1, 3) * sh
+                      xst2 = xst2 - cell_normal(2, 3) * sh
+                      xst3 = xst3 - cell_normal(3, 3) * sh
+                      sh = anint(xst2 * invcell_normal(2))
+                      xst1 = xst1 - cell_normal(1, 2) * sh
+                      xst2 = xst2 - cell_normal(2, 2) * sh
+                      xst3 = xst3 - cell_normal(3, 2) * sh
+                      sh = anint(xst1 * invcell_normal(1))
+                      xst1 = xst1 - cell_normal(1, 1) * sh
+                      xst2 = xst2 - cell_normal(2, 1) * sh
+                      xst3 = xst3 - cell_normal(3, 1) * sh
                    end if
                 endif
-                dis2 = sum(xst(1:3) ** 2)
+                dis2 = xst1*xst1 + xst2*xst2 + xst3*xst3
                 rst = sqrt(dis2)
                 if (rst > upljcut) then
                    eplj = 0.0
@@ -201,13 +259,13 @@ contains
                 endif
                 pairep = pairep + eplj + epcl
              end do
-             !$acc atomic update
-             uvengy(k, cnt) = uvengy(k, cnt) + pairep
           end do
+          !$omp atomic update
+          uvengy(k, cnt) = uvengy(k, cnt) + pairep
        end do
     end do
-    !$acc end parallel
-    !$acc end data
+    !$omp end target teams distribute parallel do
+    !$omp end target data
   end subroutine realcal_soln
 
   subroutine realcal_refs(tagslt, maxdst, slvmax, uvengy)
@@ -222,7 +280,11 @@ contains
 
     integer :: i, k, is, js, ismax, jsmax, ati, ati_ext, atj, cnt
     real(wp) :: reelcut, pairep, rst, dis2, invr2, invr3, invr6
-    real(wp) :: eplj, epcl, xst(3), half_cell(3)
+    real(wp) :: eplj, epcl, half_cell(3)
+    ! separation vector as three scalars rather than an array xst(3):
+    ! a per-thread private array tends to be placed in scratch (i.e.
+    ! global) memory on the GPU, while scalars can live in registers
+    real(wp) :: xst1, xst2, xst3, sh
     real(wp) :: lwljcut2, upljcut2
     real(wp), save :: lwljcut3, upljcut3, lwljcut6, upljcut6
     real(wp) :: ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac
@@ -258,13 +320,19 @@ contains
 
     ! calculated only when PME or PPPM, non-self interaction
     ismax = numsite(tagslt)
-    !$acc data copyin(half_cell, cell_normal, invcell_normal)
-    !$acc parallel loop collapse(3) gang vector private(xst) present(uvengy, mol_begin_index, sitepos_normal, ljlensq_mat, ljene_mat, charge, ljtype, numsite)
+    !$omp target data map(to: half_cell, cell_normal, invcell_normal)
+    !$omp target teams distribute parallel do collapse(2) &
+    !$omp&   private(xst1, xst2, xst3, sh, is, js, ati, ati_ext, atj, ljtype_i, ljtype_j, &
+    !$omp&           pairep, rst, dis2, invr2, invr3, invr6, eplj, epcl, &
+    !$omp&           ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac, &
+    !$omp&           lwljcut2, upljcut2) &
+    !$omp&   map(alloc: uvengy, mol_begin_index, sitepos_normal, ljlensq_mat, ljene_mat, charge, ljtype, numsite)
     do cnt = 1, maxdst
        do i = 1, slvmax
+          ! is kept sequential; see the note at the top of the file.
+          pairep = 0.0
           do is = 1, ismax
 
-             pairep = 0.0
              do js = 1, numsite(i)
                 ! ati = specatm(is, tagslt)
                 ati = mol_begin_index(tagslt) + (is - 1)
@@ -273,22 +341,35 @@ contains
                 atj = mol_begin_index(i) + (js - 1)
                 ljtype_i = ljtype(ati)
                 ljtype_j = ljtype(atj)
-                xst(:) = sitepos_normal(:,ati_ext) - sitepos_normal(:,atj)
+                xst1 = sitepos_normal(1,ati_ext) - sitepos_normal(1,atj)
+                xst2 = sitepos_normal(2,ati_ext) - sitepos_normal(2,atj)
+                xst3 = sitepos_normal(3,ati_ext) - sitepos_normal(3,atj)
                 if (boxshp == SYS_PERIODIC) then  ! when the system is periodic
                    if (is_cuboid) then
-                      xst(:) = half_cell(:) - abs(half_cell(:) - abs(xst(:)))
+                      xst1 = half_cell(1) - abs(half_cell(1) - abs(xst1))
+                      xst2 = half_cell(2) - abs(half_cell(2) - abs(xst2))
+                      xst3 = half_cell(3) - abs(half_cell(3) - abs(xst3))
                    else
                       ! Note some ops can be skipped because cell_normal
-                      ! is upper triangular
-                      xst(:) = xst(:) - cell_normal(:, 3) &
-                           * anint(xst(3) * invcell_normal(3))
-                      xst(:) = xst(:) - cell_normal(:, 2) &
-                           * anint(xst(2) * invcell_normal(2))
-                      xst(:) = xst(:) - cell_normal(:, 1) &
-                           * anint(xst(1) * invcell_normal(1))
+                      ! is upper triangular. Each step's shift is taken from
+                      ! the component *before* that step modifies it, which is
+                      ! what the array form xst(:) = xst(:) - c(:,n)*anint(xst(n)*..)
+                      ! did implicitly (Fortran evaluates the whole right side first).
+                      sh = anint(xst3 * invcell_normal(3))
+                      xst1 = xst1 - cell_normal(1, 3) * sh
+                      xst2 = xst2 - cell_normal(2, 3) * sh
+                      xst3 = xst3 - cell_normal(3, 3) * sh
+                      sh = anint(xst2 * invcell_normal(2))
+                      xst1 = xst1 - cell_normal(1, 2) * sh
+                      xst2 = xst2 - cell_normal(2, 2) * sh
+                      xst3 = xst3 - cell_normal(3, 2) * sh
+                      sh = anint(xst1 * invcell_normal(1))
+                      xst1 = xst1 - cell_normal(1, 1) * sh
+                      xst2 = xst2 - cell_normal(2, 1) * sh
+                      xst3 = xst3 - cell_normal(3, 1) * sh
                    end if
                 endif
-                dis2 = sum(xst(1:3) ** 2)
+                dis2 = xst1*xst1 + xst2*xst2 + xst3*xst3
                 rst = sqrt(dis2)
                 if (rst > upljcut) then
                    eplj = 0.0
@@ -360,13 +441,13 @@ contains
                 endif
                 pairep = pairep + eplj + epcl
              end do
-             !$acc atomic update
-             uvengy(i, cnt) = uvengy(i, cnt) + pairep
           end do
+          !$omp atomic update
+          uvengy(i, cnt) = uvengy(i, cnt) + pairep
        end do
     end do
-    !$acc end parallel
-    !$acc end data
+    !$omp end target teams distribute parallel do
+    !$omp end target data
   end subroutine realcal_refs
 
   ! Calculate i-j interaction energy in the bare 1/r form
@@ -382,7 +463,11 @@ contains
 
     integer :: i, k, is, js, ismax, jsmax, ati, atj
     real(wp) :: reelcut, pairep, rst, dis2, invr2, invr3, invr6
-    real(wp) :: eplj, epcl, xst(3), half_cell(3)
+    real(wp) :: eplj, epcl, half_cell(3)
+    ! separation vector as three scalars rather than an array xst(3):
+    ! a per-thread private array tends to be placed in scratch (i.e.
+    ! global) memory on the GPU, while scalars can live in registers
+    real(wp) :: xst1, xst2, xst3, sh
     real(wp) :: lwljcut2, upljcut2, lwljcut3, upljcut3, lwljcut6, upljcut6
     real(wp) :: ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac
     real(wp) :: repA, repB, repC, attA, attB, attC
@@ -413,13 +498,21 @@ contains
 
     ! Bare coulomb solute-solvent interaction
     ismax = numsite(tagslt)
-    !$acc parallel loop collapse(2) gang vector private(xst) present(uvengy, mol_begin_index, tagpt, sitepos_normal, charge, numsite)
+    !$omp target teams distribute parallel do &
+    !$omp&   private(xst1, xst2, xst3, sh, i, is, js, ati, atj, ljtype_i, ljtype_j, &
+    !$omp&           pairep, rst, dis2, invr2, invr3, invr6, eplj, epcl, &
+    !$omp&           ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac, &
+    !$omp&           lwljcut2, upljcut2) &
+    !$omp&   map(alloc: uvengy, mol_begin_index, tagpt, sitepos_normal, charge, numsite, &
+    !$omp&              ljtype, ljene_mat, ljlensq_mat) &
+    !$omp&   map(to: half_cell, cell_normal, invcell_normal)
     do k = 1, slvmax
-       do is = 1, ismax
-          i = tagpt(k)
-          if (i == tagslt) cycle
+       ! is kept sequential; see the note at the top of the file.
+       i = tagpt(k)
+       if (i == tagslt) cycle
 
-          pairep = 0.0
+       pairep = 0.0
+       do is = 1, ismax
           do js = 1, numsite(i)
 !             ati = specatm(is, tagslt)
 !             atj = specatm(js, i)
@@ -427,21 +520,35 @@ contains
              atj = mol_begin_index(i) + (js - 1)
              ljtype_i = ljtype(ati)
              ljtype_j = ljtype(atj)
-             xst(:) = sitepos_normal(:,ati) - sitepos_normal(:,atj)
-             if (boxshp == SYS_PERIODIC) then    ! when the system is periodic
+             xst1 = sitepos_normal(1,ati) - sitepos_normal(1,atj)
+             xst2 = sitepos_normal(2,ati) - sitepos_normal(2,atj)
+             xst3 = sitepos_normal(3,ati) - sitepos_normal(3,atj)
+             if (boxshp == SYS_PERIODIC) then  ! when the system is periodic
                 if (is_cuboid) then
-                   xst(:) = half_cell(:) - abs(half_cell(:) - abs(xst(:)))
+                   xst1 = half_cell(1) - abs(half_cell(1) - abs(xst1))
+                   xst2 = half_cell(2) - abs(half_cell(2) - abs(xst2))
+                   xst3 = half_cell(3) - abs(half_cell(3) - abs(xst3))
                 else
-                   ! Note some ops can be skipped because cell_normal is upper triangular
-                   xst(:) = xst(:) - cell_normal(:, 3) &
-                        * anint(xst(3) * invcell_normal(3))
-                   xst(:) = xst(:) - cell_normal(:, 2) &
-                        * anint(xst(2) * invcell_normal(2))
-                   xst(:) = xst(:) - cell_normal(:, 1) &
-                        * anint(xst(1) * invcell_normal(1))
+                   ! Note some ops can be skipped because cell_normal
+                   ! is upper triangular. Each step's shift is taken from
+                   ! the component *before* that step modifies it, which is
+                   ! what the array form xst(:) = xst(:) - c(:,n)*anint(xst(n)*..)
+                   ! did implicitly (Fortran evaluates the whole right side first).
+                   sh = anint(xst3 * invcell_normal(3))
+                   xst1 = xst1 - cell_normal(1, 3) * sh
+                   xst2 = xst2 - cell_normal(2, 3) * sh
+                   xst3 = xst3 - cell_normal(3, 3) * sh
+                   sh = anint(xst2 * invcell_normal(2))
+                   xst1 = xst1 - cell_normal(1, 2) * sh
+                   xst2 = xst2 - cell_normal(2, 2) * sh
+                   xst3 = xst3 - cell_normal(3, 2) * sh
+                   sh = anint(xst1 * invcell_normal(1))
+                   xst1 = xst1 - cell_normal(1, 1) * sh
+                   xst2 = xst2 - cell_normal(2, 1) * sh
+                   xst3 = xst3 - cell_normal(3, 1) * sh
                 end if
              endif
-             dis2 = sum(xst(1:3) ** 2)
+             dis2 = xst1*xst1 + xst2*xst2 + xst3*xst3
              rst = sqrt(dis2)
              if (rst > upljcut) then
                 eplj = 0.0
@@ -510,11 +617,11 @@ contains
              endif
              pairep = pairep + eplj + epcl
           end do
-          !$acc atomic update
-          uvengy(k, cnt) = uvengy(k, cnt) + pairep
        end do
+       !$omp atomic update
+       uvengy(k, cnt) = uvengy(k, cnt) + pairep
     end do
-    !$acc end parallel
+    !$omp end target teams distribute parallel do
   end subroutine realcal_bare
 
   subroutine realcal_bare_refs(tagslt, maxdst, slvmax, uvengy)
@@ -527,9 +634,13 @@ contains
     integer, intent(in) :: tagslt, maxdst, slvmax
     real(wp), intent(inout) :: uvengy(:, :)
 
-    integer :: i, is, js, ismax, jsmax, ati, ati_ext, atj, cnt
+    integer :: i, k, is, js, ismax, jsmax, ati, ati_ext, atj, cnt
     real(wp) :: reelcut, pairep, rst, dis2, invr2, invr3, invr6
-    real(wp) :: eplj, epcl, xst(3), half_cell(3)
+    real(wp) :: eplj, epcl, half_cell(3)
+    ! separation vector as three scalars rather than an array xst(3):
+    ! a per-thread private array tends to be placed in scratch (i.e.
+    ! global) memory on the GPU, while scalars can live in registers
+    real(wp) :: xst1, xst2, xst3, sh
     real(wp) :: lwljcut2, upljcut2, lwljcut3, upljcut3, lwljcut6, upljcut6
     real(wp) :: ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac
     real(wp) :: repA, repB, repC, attA, attB, attC
@@ -560,12 +671,19 @@ contains
 
     ! Bare coulomb solute-solvent interaction
     ismax = numsite(tagslt)
-    !$acc parallel loop collapse(3) gang vector private(xst) present(uvengy, mol_begin_index, sitepos_normal, charge, numsite)
+    !$omp target teams distribute parallel do collapse(2) &
+    !$omp&   private(xst1, xst2, xst3, sh, is, js, ati, ati_ext, atj, ljtype_i, ljtype_j, &
+    !$omp&           pairep, rst, dis2, invr2, invr3, invr6, eplj, epcl, &
+    !$omp&           ljeps, ljsgm2, ljsgm3, ljsgm6, vdwa, vdwb, swth, swfac, &
+    !$omp&           lwljcut2, upljcut2) &
+    !$omp&   map(alloc: uvengy, mol_begin_index, sitepos_normal, charge, numsite, &
+    !$omp&              ljtype, ljene_mat, ljlensq_mat) &
+    !$omp&   map(to: half_cell, cell_normal, invcell_normal)
     do cnt = 1, maxdst
        do i = 1, slvmax
+          ! is kept sequential; see the note at the top of the file.
+          pairep = 0.0
           do is = 1, ismax
-
-             pairep = 0.0
              do js = 1, numsite(i)
                 ! ati = specatm(is, tagslt)
                 ati = mol_begin_index(tagslt) + (is - 1)
@@ -574,21 +692,35 @@ contains
                 atj = mol_begin_index(i) + (js - 1)
                 ljtype_i = ljtype(ati)
                 ljtype_j = ljtype(atj)
-                xst(:) = sitepos_normal(:,ati_ext) - sitepos_normal(:,atj)
+                xst1 = sitepos_normal(1,ati_ext) - sitepos_normal(1,atj)
+                xst2 = sitepos_normal(2,ati_ext) - sitepos_normal(2,atj)
+                xst3 = sitepos_normal(3,ati_ext) - sitepos_normal(3,atj)
                 if (boxshp == SYS_PERIODIC) then  ! when the system is periodic
                    if (is_cuboid) then
-                      xst(:) = half_cell(:) - abs(half_cell(:) - abs(xst(:)))
+                      xst1 = half_cell(1) - abs(half_cell(1) - abs(xst1))
+                      xst2 = half_cell(2) - abs(half_cell(2) - abs(xst2))
+                      xst3 = half_cell(3) - abs(half_cell(3) - abs(xst3))
                    else
-                      ! Note some ops can be skipped because cell_normal is upper triangular
-                      xst(:) = xst(:) - cell_normal(:, 3) &
-                           * anint(xst(3) * invcell_normal(3))
-                      xst(:) = xst(:) - cell_normal(:, 2) &
-                           * anint(xst(2) * invcell_normal(2))
-                      xst(:) = xst(:) - cell_normal(:, 1) &
-                           * anint(xst(1) * invcell_normal(1))
+                      ! Note some ops can be skipped because cell_normal
+                      ! is upper triangular. Each step's shift is taken from
+                      ! the component *before* that step modifies it, which is
+                      ! what the array form xst(:) = xst(:) - c(:,n)*anint(xst(n)*..)
+                      ! did implicitly (Fortran evaluates the whole right side first).
+                      sh = anint(xst3 * invcell_normal(3))
+                      xst1 = xst1 - cell_normal(1, 3) * sh
+                      xst2 = xst2 - cell_normal(2, 3) * sh
+                      xst3 = xst3 - cell_normal(3, 3) * sh
+                      sh = anint(xst2 * invcell_normal(2))
+                      xst1 = xst1 - cell_normal(1, 2) * sh
+                      xst2 = xst2 - cell_normal(2, 2) * sh
+                      xst3 = xst3 - cell_normal(3, 2) * sh
+                      sh = anint(xst1 * invcell_normal(1))
+                      xst1 = xst1 - cell_normal(1, 1) * sh
+                      xst2 = xst2 - cell_normal(2, 1) * sh
+                      xst3 = xst3 - cell_normal(3, 1) * sh
                    end if
                 endif
-                dis2 = sum(xst(1:3) ** 2)
+                dis2 = xst1*xst1 + xst2*xst2 + xst3*xst3
                 rst = sqrt(dis2)
                 if (rst > upljcut) then
                    eplj = 0.0
@@ -659,12 +791,12 @@ contains
                 endif
                 pairep = pairep + eplj + epcl
              end do
-             !$acc atomic update
-             uvengy(i, cnt) = uvengy(i, cnt) + pairep
           end do
+          !$omp atomic update
+          uvengy(i, cnt) = uvengy(i, cnt) + pairep
        end do
     end do
-    !$acc end parallel
+    !$omp end target teams distribute parallel do
   end subroutine realcal_bare_refs
 
   ! self-energy part, no LJ calculation performed
