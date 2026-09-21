@@ -342,10 +342,10 @@ contains
     if (myrank == 0) then
        if (slttype == SLT_SOLN) then
           ! open flcuv file
-          open(unit = io_flcuv, file = 'flcuv.tt', status = 'new', action = 'write')
+          open(unit = io_flcuv, file = 'flcuv.tt', status = 'replace', action = 'write')
        else
           ! open progress file
-          open(unit = io_flcuv, file = 'progress.tt', status = 'new', action = 'write')
+          open(unit = io_flcuv, file = 'progress.tt', status = 'replace', action = 'write')
        endif
     endif
 

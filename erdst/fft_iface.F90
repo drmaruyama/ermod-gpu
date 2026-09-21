@@ -47,6 +47,9 @@ module fft_iface
 
   type fft_handle
      type(c_ptr) :: plan = c_null_ptr
+     ! transforms per execution: 1 for hipfftPlan3d plans, nbatch for
+     ! the batched hipfftPlanMany plans below
+     integer :: nbatch = 1
   end type fft_handle
 
 contains 
@@ -167,6 +170,143 @@ contains
     !$omp end target data
     call check_hipfft_status(stat, "hipfftExecC2R/Z2D (fft_ctr)")
   end subroutine fft_ctr
+
+  ! ---- batched transforms (used by recpcal.F90's recpcal_prepare_solute_refs) ----
+  !
+  ! One hipfftPlanMany plan transforms nbatch grids per execution. The
+  ! batch stride is one whole grid: Fortran stores a(:,:,:,cnt) with cnt
+  ! slowest, so each trial's grid is already contiguous.
+  !
+  ! Dimension order: hipFFT takes n() slowest-axis first and halves the
+  ! LAST axis for R2C. Our arrays halve the FIRST Fortran axis (the
+  ! fastest in memory), so n() = (/ fftsize(3), fftsize(2), fftsize(1) /).
+  ! (The unbatched hipfftPlan3d calls above pass the sizes the other
+  ! way round, which only coincides with this for a cubic grid.)
+  !
+  ! Two pitfalls found the hard way, both handled below:
+  !  * the rank-4 buffers must be passed as c_ptr (hipfort's generics
+  !    stop at rank 3), and c_loc() inside a use_device_addr region
+  !    returns the HOST address with this compiler -- on an APU that
+  !    silently transforms the host copy -- so the device address is
+  !    fetched explicitly with omp_get_mapped_ptr;
+  !  * hipFFT runs on HIP's stream, unordered with OpenMP's, so each
+  !    execution is followed by a device-wide synchronize.
+
+  subroutine fft_init_rtc_batch(handle, nbatch)
+    type(fft_handle), intent(out) :: handle
+    integer, intent(in) :: nbatch
+    integer :: stat, n(3), inembed(3), onembed(3), idist, odist
+
+    n(1) = fftsize(3) ; n(2) = fftsize(2) ; n(3) = fftsize(1)
+    inembed(:) = n(:)
+    onembed(1) = fftsize(3) ; onembed(2) = fftsize(2)
+    onembed(3) = fftsize(1)/2 + 1
+    idist = fftsize(1) * fftsize(2) * fftsize(3)
+    odist = (fftsize(1)/2 + 1) * fftsize(2) * fftsize(3)
+#ifdef DP
+    stat = hipfftPlanMany(handle%plan, 3, n, inembed, 1, idist, &
+         onembed, 1, odist, HIPFFT_D2Z, nbatch)
+#else
+    stat = hipfftPlanMany(handle%plan, 3, n, inembed, 1, idist, &
+         onembed, 1, odist, HIPFFT_R2C, nbatch)
+#endif
+    call check_hipfft_status(stat, "hipfftPlanMany (fft_init_rtc_batch)")
+    handle%nbatch = nbatch
+  end subroutine fft_init_rtc_batch
+
+  subroutine fft_init_ctr_batch(handle, nbatch)
+    type(fft_handle), intent(out) :: handle
+    integer, intent(in) :: nbatch
+    integer :: stat, n(3), inembed(3), onembed(3), idist, odist
+
+    n(1) = fftsize(3) ; n(2) = fftsize(2) ; n(3) = fftsize(1)
+    inembed(1) = fftsize(3) ; inembed(2) = fftsize(2)
+    inembed(3) = fftsize(1)/2 + 1
+    onembed(:) = n(:)
+    idist = (fftsize(1)/2 + 1) * fftsize(2) * fftsize(3)
+    odist = fftsize(1) * fftsize(2) * fftsize(3)
+#ifdef DP
+    stat = hipfftPlanMany(handle%plan, 3, n, inembed, 1, idist, &
+         onembed, 1, odist, HIPFFT_Z2D, nbatch)
+#else
+    stat = hipfftPlanMany(handle%plan, 3, n, inembed, 1, idist, &
+         onembed, 1, odist, HIPFFT_C2R, nbatch)
+#endif
+    call check_hipfft_status(stat, "hipfftPlanMany (fft_init_ctr_batch)")
+    handle%nbatch = nbatch
+  end subroutine fft_init_ctr_batch
+
+  subroutine fft_rtc_batch(handle, in, out)
+    use hipfort_hipfft
+    use iso_c_binding, only: c_ptr, c_loc, c_associated
+    use omp_lib, only: omp_get_mapped_ptr, omp_get_default_device
+    type(fft_handle), intent(in) :: handle
+    real(wp), intent(in), target :: &
+         in(fftsize(1), fftsize(2), fftsize(3), handle%nbatch)
+    complex(wp), intent(out), target :: &
+         out(fftsize(1)/2+1, fftsize(2), fftsize(3), handle%nbatch)
+    integer :: stat, dev
+    type(c_ptr) :: p_in, p_out
+
+    dev = omp_get_default_device()
+    p_in  = omp_get_mapped_ptr(c_loc(in(1,1,1,1)),  dev)
+    p_out = omp_get_mapped_ptr(c_loc(out(1,1,1,1)), dev)
+    if (.not. c_associated(p_in) .or. .not. c_associated(p_out)) then
+       call check_hipfft_status(4, "fft_rtc_batch: buffer not mapped on device")
+       return
+    end if
+#ifdef DP
+    stat = hipfftExecD2Z(handle%plan, p_in, p_out)
+#else
+    stat = hipfftExecR2C(handle%plan, p_in, p_out)
+#endif
+    call check_hipfft_status(stat, "hipfftExecR2C/D2Z (fft_rtc_batch)")
+    call sync_after_fft("fft_rtc_batch")
+  end subroutine fft_rtc_batch
+
+  subroutine fft_ctr_batch(handle, in, out)
+    use hipfort_hipfft
+    use iso_c_binding, only: c_ptr, c_loc, c_associated
+    use omp_lib, only: omp_get_mapped_ptr, omp_get_default_device
+    type(fft_handle), intent(in) :: handle
+    complex(wp), intent(in), target :: &
+         in(fftsize(1)/2+1, fftsize(2), fftsize(3), handle%nbatch)
+    real(wp), intent(out), target :: &
+         out(fftsize(1), fftsize(2), fftsize(3), handle%nbatch)
+    integer :: stat, dev
+    type(c_ptr) :: p_in, p_out
+
+    dev = omp_get_default_device()
+    p_in  = omp_get_mapped_ptr(c_loc(in(1,1,1,1)),  dev)
+    p_out = omp_get_mapped_ptr(c_loc(out(1,1,1,1)), dev)
+    if (.not. c_associated(p_in) .or. .not. c_associated(p_out)) then
+       call check_hipfft_status(4, "fft_ctr_batch: buffer not mapped on device")
+       return
+    end if
+#ifdef DP
+    stat = hipfftExecZ2D(handle%plan, p_in, p_out)
+#else
+    stat = hipfftExecC2R(handle%plan, p_in, p_out)
+#endif
+    call check_hipfft_status(stat, "hipfftExecC2R/Z2D (fft_ctr_batch)")
+    call sync_after_fft("fft_ctr_batch")
+  end subroutine fft_ctr_batch
+
+  subroutine sync_after_fft(location)
+    use hipfort, only: hipDeviceSynchronize, hipSuccess
+    use engmain, only: stdout
+    use mpiproc, only: mpi_abend
+    implicit none
+    character(len=*), intent(in) :: location
+    integer :: stat
+    stat = hipDeviceSynchronize()
+    if (stat /= hipSuccess) then
+       write(stdout, "(A,A,A,I0)") " hipDeviceSynchronize failed after ", &
+            trim(location), ": status = ", stat
+       call mpi_abend()
+       stop "hipDeviceSynchronize failed"
+    end if
+  end subroutine sync_after_fft
 
   subroutine fft_cleanup_rtc(handle)
     type(fft_handle), intent(in) :: handle
