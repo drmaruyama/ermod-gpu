@@ -16,23 +16,6 @@
 ! along with this program; if not, write to the Free Software
 ! Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
-! =====================================================================
-! [OpenMP target offload 検証版]
-! cufftへデバイスポインタを渡す部分(旧 "!$acc host_data use_device")を
-! OpenMPの "use_device_addr" 節へ変換した検証用ブランチのバージョンです。
-! cufft自体はNVIDIA専用ライブラリなので、AMD向けの本実装では別途
-! hipfft(ROCm)への置き換えが必要です。これはあくまでnvfortran上での
-! OpenMP化検証のための中間ステップで、cufft呼び出しそのものは変更して
-! いません。
-!
-! !$acc data present(in, out) + !$acc host_data use_device(in, out)
-!   -> !$omp target data map(alloc: in, out) use_device_addr(in, out)
-!
-! in/out(実引数はrecpcal.F90のcnvslt/rcpslt)は、recpcal_init側の
-! OpenMP target enter dataで既にデバイス上に存在している前提です。
-! use openacc は不要になったため削除しています。
-! =====================================================================
-
 module fft_iface
   use precision_kinds, only: wp
   use cufft
@@ -132,34 +115,38 @@ contains
   end subroutine fft_init_ctr
 
   subroutine fft_rtc(handle, in, out)
+    use openacc
     use cufft
     type(fft_handle), intent(in) :: handle
     real(wp), intent(in) :: in(fftsize(1), fftsize(2), fftsize(3))
     complex(wp), intent(out) :: out(fftsize(1)/2+1, fftsize(2), fftsize(3))
     integer :: stat
-    !$omp target data map(alloc: in, out) use_device_addr(in, out)
+    !$acc data present(in, out)
+    !$acc host_data use_device(in, out)
 #ifdef DP
     stat = cufftExecD2Z(handle%plan, in, out)
 #else
     stat = cufftExecR2C(handle%plan, in, out)
 #endif
-    !$omp end target data
+    !$acc end host_data
+    !$acc end data
     call check_cufft_status(stat, "cufftExecR2C/D2Z (fft_rtc)")
   end subroutine fft_rtc
 
   subroutine fft_ctr(handle, in, out)
-    use cufft
     type(fft_handle), intent(in) :: handle
     complex(wp), intent(in) :: in(fftsize(1)/2+1, fftsize(2), fftsize(3))
     real(wp), intent(out) :: out(fftsize(1), fftsize(2), fftsize(3))
     integer :: stat
-    !$omp target data map(alloc: in, out) use_device_addr(in, out)
+    !$acc data present(in, out)
+    !$acc host_data use_device(in, out)
 #ifdef DP
     stat = cufftExecZ2D(handle%plan, in, out)
 #else
     stat = cufftExecC2R(handle%plan, in, out)
 #endif
-    !$omp end target data
+    !$acc end host_data
+    !$acc end data
     call check_cufft_status(stat, "cufftExecC2R/Z2D (fft_ctr)")
   end subroutine fft_ctr
 
