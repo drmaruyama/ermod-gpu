@@ -1,0 +1,104 @@
+The programs contained in this directory are to be used by replacing the original program files distributed. They compute the distribution functions conditioned by an order parameter.
+
+The program set is still under development, and should not be used unless user is familiar with ERmod. All the additions to the original program files are closed by
+    ! start of the extension for computing the conditional distributions
+and
+    ! end of the extension for computing the conditional distributions
+
+To use the executable program of erdst, there needs another section of "&conditional" in parameters_er read as;
+
+&ene_param
+...
+/
+&hist
+...
+/
+&conditional
+   do_conditional = 1,
+   order_species = ...,
+   order_min = ...,
+   order_max = ...,
+   order_binwidth = ...,
+/
+
+The erdst executable with the modified programs in this directory requires the presence of the &conditional section in parameters_er. Still, when do_conditional is set to a value other than 1 or when the line of "do_conditional = X" is not present, the outputs from the modified erdst are identical to those from the original one.
+
+If order_species = 0, the user-defined order parameter needs to be calculated in the update_histogram subroutine. The scheme of particle insertion may be necessary to be devised, in addition. If order_species is equal to the index of one of the solvent species, the value of order parameter is the sum of the interaction energy between the solute and the order_species-th solvent species. See the relevant parts of engproc.F90 for the details about order_species.
+
+If user prepares a file OrderPrmTraj, he/she does not need to set a value to order_species and the program reads the value of order parameter from OrderPrmTraj.
+The format of OrderPrmTraj is
+  (snapshot number of MD)   (solute number)  (value of order parameter)
+The first column corresponds to the snapshot number of the trajectory (HISTORY).
+The second column varies from 1 to numslt (the number of solute molecules) when the system is the solution (soln), and from 1 to maxins (the number of particle insertions) when the system is the reference solvent (refs).
+The second column is always 1 when the system is soln and the number of solute molecules is 1.
+The first and second columns are integers, and the third is real.
+
+Often the OrderPrmTraj file is prepared directly by using the solute-solvent configurations treated with the erdst program. In this case, the solute configuration read from SltConf is used as is and it is necessary to set insposition = 1 and insorient = 1 in parameters_er.
+
+The minimum and maximum values of the order parameter are order_min and order_max, respectively, and in numerical treatment, the order parameter is binned with order_binwidth at equal intervals.
+Within the program, the number of bins for order parameter is order_size. If user prepares a file OrderPrmCoord, it is not necessary to set values to order_min, order_max, and order_binwidth; they will be simply ingnored.
+The format of OrderPrmCoord is
+  (line number, integer)  (boundary of bin for order parameter, real)
+The value of the first column is not used in the erdst program.
+The boundary in the second column is the minimum of each bin. When its i-th and (i+1)-th values are a(i) and a(i+1), respectively, the data is to be added to the i-th bin when the corresponding value x of order parameter is a(i) <= x < a(i+1).
+
+
+The outputs for the conditional calculations are as follows
+(see the engstore subroutine for details):
+
+  filename:
+    output format of the file
+    name and size within the engproc.F90 program
+
+soln:
+  nmcdsl.XX (XX = 01, ... engdiv within parameters_er):
+    probability for the value of order parameter
+    cndnorm(order_size)
+  ecndsl.XX (XX = 01, ... engdiv within parameters_er):
+    energy coordinate, solvent species, distribution
+    edcnd(ermax, order_size)
+  avcnd.tt:
+    block (corresponding to XX for nmcdsl), average energy
+    avuvcnd(engdiv, numslv, order_size)
+
+refs:
+  nmcdrf.XX (XX = 01, ... engdiv within parameters_er):
+    probability for the value of order parameter
+    cndnorm(order_size)
+  ecndrf.XX (XX = 01, ... engdiv within parameters_er):
+    energy coordinate, solvent species, distribution
+    edcnd(ermax, order_size)
+  crcdrf.XX (XX = 01, ... engdiv within parameters_er):
+    distribution
+    crcnd(ermax, ermax, order_size); this data is unformatted at output
+
+The conditional free energies may be computed with the following schemes.
+1)  Prepare directories of CondYY, where YY = 1, ... order_size.
+2)  Within each CondYY, prepare the soln and refs directories.
+3)  Take the first ermax lines of ecndsl.XX to Cond01/soln
+    and set the filenames to engsln.XX.
+    Take the first engdiv lines of avcnd.tt to Cond01/soln
+    and set the filename to aveuv.tt
+4)  Skip one lines of ecndsl.XX and avcnd.tt.
+    Take the next ermax lines of ecndsl.XX to Cond02/soln
+    and set the filenames to engsln.XX.
+    Take the next engdiv lines of avcnd.tt to Cond02/soln
+    and set the filename to aveuv.tt
+5)  Do 4) for YY = 03, ... order_size.
+6)  Take the first ermax lines of ecndrf.XX to Cond01/refs
+    and set the filenames to engref.XX.
+    Take the first ermax*ermax data of crcdrf.XX to Cond01/refs
+    and set the filenames to corref.XX.
+7)  Skip one lines of ecndrf.XX and corref.XX.
+    Take the next ermax lines of ecndrf.XX to Cond02/refs
+    and set the filenames to engref.XX.
+    Take the next ermax*ermax data of crcdrf.XX to Cond02/refs
+    and set the filenames to corref.XX.
+8)  Do 7) for YY = 03, ... order_size.
+9)  Copy refs/weight_refs to all of CondYY/refs
+10) See the 1st lines of nmcdsl.XX and nmcdrf.XX.
+11) If either of the values at any XX is zero, go to 12).
+    If both the values for nmcdsl.XX and nmcdrf.XX are not zero at all the XX,
+    go to CondYY (YY = 01) and execute slvfe.
+12) See the next lines of nmcdsl.XX and nmcdrf.XX and do 11) with increased YY.
+13) Do 12) toward YY = order_size.

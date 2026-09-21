@@ -1,0 +1,120 @@
+ACLOCAL_AMFLAGS = -I m4
+
+bin_PROGRAMS = erdst
+nobase_pkgdata_SCRIPTS = \
+	../tools/AMBER/gen_structure ../tools/AMBER/gen_input \
+	../tools/GROMACS/gen_structure ../tools/GROMACS/gen_input \
+	../tools/NAMD/gen_structure ../tools/NAMD/gen_input \
+	../tools/LAMMPS/gen_structure ../tools/LAMMPS/gen_input \
+	../tools/CHARMM/gen_structure ../tools/CHARMM/gen_input \
+	../tools/GENESIS/gen_structure ../tools/GENESIS/gen_input \
+	../tools/GENESIS/gen_structure_AMBER \
+	../tools/GENESIS/gen_structure_CHARMM \
+	../tools/GENESIS/gen_structure_GROMACS \
+	../tools/refs_converge 
+
+#	tools/GENESIS/gen_structure_GROMACS # <- In GENESIS, GROMACS is unsupported officially so not included in SCRIPTS
+
+dist_pkglibexec_SCRIPTS = $(top_srcdir)/../vmdplugins/libexec/*.so
+
+# Shared with the OpenMP build. These live in ../erdst-common and are
+# linked into this directory by configure (AC_CONFIG_LINKS), so they are
+# listed here by bare name; see configure.ac for why.
+common_sources = precision.F90 spline.F90 trajectory.F90 utility.F90 enganal.F90
+
+# Specific to the OpenACC build.
+acc_sources = randgen.F90 engmain.F90 realcal.F90 fft_iface.F90 mpiproc.F90 \
+	engproc.F90 recpcal.F90 insertion.F90 setconf.F90 bestfit.F90
+
+ersources = $(common_sources) $(acc_sources)
+
+# where the shared sources really are (for the dependency rules below)
+COMMON_SRCDIR = $(top_srcdir)/../erdst-common
+
+EXTRA_DIST = ../parameters_er.example ../parameters_fe.example
+EXTRA_DIST += ../extensions/*
+EXTRA_DIST += ../trajectory-formats/*
+EXTRA_DIST += ../tools/AMBER/*
+EXTRA_DIST += ../tools/GROMACS/*
+EXTRA_DIST += ../tools/NAMD/*
+EXTRA_DIST += ../tools/LAMMPS/*
+EXTRA_DIST += ../tools/CHARMM/*
+EXTRA_DIST += ../tools/GENESIS/*
+EXTRA_DIST += ../tools/mol_dissection
+EXTRA_DIST += ../tools/refs_converge ../tools/refs_converge_py2 ../tools/refs_converge_py3
+EXTRA_DIST += ../vmdplugins/*.C ../vmdplugins/*.c ../vmdplugins/*.h ../vmdplugins/*.cxx ../vmdplugins/*.hxx ../vmdplugins/Makefile ../vmdplugins/LICENSE
+CLEANFILES = *.mod
+
+erdst_SOURCES = $(ersources)
+AM_CFLAGS = -DINSTALL_PLUGIN_PATH=\"$(pkglibexecdir)\"
+AM_FCFLAGS = $(VMDPLUGINFLAGS)
+erdst_LDADD = $(LAPACK_LIBS) $(BLAS_LIBS) $(MPILIBS) -ldl -lm
+
+if USE_VMDPLUGIN
+erdst_SOURCES += vmdfio.c
+endif
+
+if USE_TRANSFER
+AM_FCFLAGS += -DHAVE_TRANSFER
+else
+erdst_SOURCES += hash_real.c
+endif
+
+if USE_FLUSH
+AM_FCFLAGS += -DHAVE_FLUSH
+endif
+
+extra_flags = 
+
+# module dependencies
+$(top_builddir)/enganal.$(OBJEXT): $(COMMON_SRCDIR)/enganal.F90 \
+    $(top_builddir)/engproc.$(OBJEXT) \
+    $(top_builddir)/setconf.$(OBJEXT) \
+    $(top_builddir)/insertion.$(OBJEXT) \
+    $(top_builddir)/trajectory.$(OBJEXT) \
+    $(top_builddir)/mpiproc.$(OBJEXT) \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/engproc.$(OBJEXT): $(top_srcdir)/engproc.F90 \
+    $(top_builddir)/insertion.$(OBJEXT) \
+    $(top_builddir)/realcal.$(OBJEXT) \
+    $(top_builddir)/recpcal.$(OBJEXT) \
+    $(top_builddir)/bestfit.$(OBJEXT) \
+    $(top_builddir)/utility.$(OBJEXT) \
+    $(top_builddir)/mpiproc.$(OBJEXT) \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/realcal.$(OBJEXT): $(top_srcdir)/realcal.F90 \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/recpcal.$(OBJEXT): $(top_srcdir)/recpcal.F90 \
+    $(top_builddir)/spline.$(OBJEXT) \
+    $(top_builddir)/fft_iface.$(OBJEXT) \
+    $(top_builddir)/mpiproc.$(OBJEXT) \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/fft_iface.$(OBJEXT): $(top_srcdir)/fft_iface.F90 \
+    $(top_builddir)/mpiproc.$(OBJEXT) \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/spline.$(OBJEXT): $(COMMON_SRCDIR)/spline.F90 \
+    $(top_builddir)/precision.$(OBJEXT)
+$(top_builddir)/insertion.$(OBJEXT): $(top_srcdir)/insertion.F90 \
+    $(top_builddir)/randgen.$(OBJEXT) \
+    $(top_builddir)/setconf.$(OBJEXT) \
+    $(top_builddir)/bestfit.$(OBJEXT) \
+    $(top_builddir)/trajectory.$(OBJEXT) \
+    $(top_builddir)/mpiproc.$(OBJEXT) \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/randgen.$(OBJEXT): $(top_srcdir)/randgen.F90
+$(top_builddir)/setconf.$(OBJEXT): $(top_srcdir)/setconf.F90 \
+    $(top_builddir)/utility.$(OBJEXT) \
+    $(top_builddir)/trajectory.$(OBJEXT) \
+    $(top_builddir)/mpiproc.$(OBJEXT) \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/bestfit.$(OBJEXT): $(top_srcdir)/bestfit.F90 \
+    $(top_builddir)/mpiproc.$(OBJEXT)
+$(top_builddir)/trajectory.$(OBJEXT): $(COMMON_SRCDIR)/trajectory.F90 \
+    $(top_builddir)/utility.$(OBJEXT)
+$(top_builddir)/utility.$(OBJEXT): $(COMMON_SRCDIR)/utility.F90 \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/mpiproc.$(OBJEXT): $(top_srcdir)/mpiproc.F90 \
+    $(top_builddir)/engmain.$(OBJEXT)
+$(top_builddir)/engmain.$(OBJEXT): $(top_srcdir)/engmain.F90 \
+    $(top_builddir)/precision.$(OBJEXT)
+

@@ -1,0 +1,301 @@
+! -*- F90 -*-
+! ERmod - Energy Representation Module
+! Copyright (C) 2000- The ERmod authors
+! 
+! This program is free software; you can redistribute it and/or
+! modify it under the terms of the GNU General Public License
+! as published by the Free Software Foundation; either version 2
+! of the License, or (at your option) any later version.
+! 
+! This program is distributed in the hope that it will be useful,
+! but WITHOUT ANY WARRANTY; without even the implied warranty of
+! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+! GNU General Public License for more details.
+! 
+! You should have received a copy of the GNU General Public License
+! along with this program; if not, write to the Free Software
+! Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+! mpi module
+
+module mpiproc
+#ifdef MPI
+  ! MPI
+  use mpi
+#endif
+  use precision_kinds, only: wp
+  implicit none
+
+#ifndef MPI
+  integer, parameter :: mpi_status_size = 1
+#endif
+
+  ! mpi common variables
+  integer :: ierror, mpistatus(mpi_status_size)
+  integer :: myrank, nprocs       ! rank number and total number of processes
+  integer :: local_rank, local_size
+  integer :: nactiveproc          ! number of active processes
+  integer, parameter :: tag_cell = 11, tag_coord = 12, tag_weight = 13
+  integer, parameter :: tag_sltcrd = 22, tag_sltwgt = 23
+  integer :: mpi_comm_activeprocs, local_comm
+
+contains
+  subroutine mpi_setup(type)
+    use openacc
+    implicit none
+    character(len=4) :: type
+    integer :: i
+#ifdef MPI
+    real(4) :: cputime
+    real(8), save :: walltime
+    if (type == 'init') then
+       call mpi_init(ierror)
+       call mpi_rank_size_info
+       call acc_set_device_num(local_rank, acc_device_nvidia)
+    endif
+    if (type == 'stop') then
+       call mpi_finalize(ierror)
+    endif
+#else
+    if (type == 'init') call mpi_rank_size_info
+#endif
+  end subroutine mpi_setup
+
+  subroutine mpi_rank_size_info
+    nprocs = 1
+    myrank = 0
+#ifdef MPI
+    call mpi_comm_size(mpi_comm_world, nprocs, ierror)
+    call mpi_comm_rank(mpi_comm_world, myrank, ierror)
+    call mpi_comm_split_type(mpi_comm_world, mpi_comm_type_shared, 0, mpi_info_null, local_comm, ierror)
+    call mpi_comm_size(local_comm, local_size, ierror)
+    call mpi_comm_rank(local_comm, local_rank, ierror)
+#endif
+    return
+  end subroutine mpi_rank_size_info
+
+  subroutine mpi_abend()
+#ifdef MPI
+    call mpi_abort(mpi_comm_world, 1, ierror)
+#endif
+  end subroutine mpi_abend
+
+  subroutine mpi_init_active_group(nactive)
+    implicit none
+    integer, intent(in) :: nactive
+
+#ifdef MPI
+    if (myrank < nactive) then
+       call mpi_comm_split(mpi_comm_world, 1, myrank, mpi_comm_activeprocs, ierror)
+    else
+       call mpi_comm_split(mpi_comm_world, mpi_undefined, 0, mpi_comm_activeprocs, ierror)
+    endif
+
+    if (myrank >= nactive .and. mpi_comm_activeprocs /= mpi_comm_null) then
+       stop "failed @ mpi_init_active_group"
+    endif
+#endif
+  end subroutine mpi_init_active_group
+
+  subroutine mpi_finish_active_group()
+    implicit none
+#ifdef MPI
+    if (mpi_comm_activeprocs /= mpi_comm_null) then
+       call mpi_comm_free(mpi_comm_activeprocs, ierror)
+    end if
+#endif
+  end subroutine mpi_finish_active_group
+
+  ! helper library for reduce variables
+  ! Note: mpi_reduce(mpi_in_place, ...) seems to be allowed only on MPI 2.2+
+  subroutine mympi_reduce_real_array(data, data_size, operation, rootrank)
+    implicit none
+    integer, intent(in) :: data_size, operation, rootrank
+    real(wp), intent(inout) :: data(data_size)
+    real(wp), allocatable :: buf(:)
+    integer :: mympi_realkind
+#ifdef MPI
+    allocate( buf(data_size) )
+    call get_mympi_realkind(kind(data), mympi_realkind)
+    call mpi_reduce(data, buf, data_size, mympi_realkind, operation, rootrank, mpi_comm_world, ierror)
+    data(:) = buf(:)
+    deallocate(buf)
+#endif
+  end subroutine mympi_reduce_real_array
+
+  subroutine mympi_reduce_real8_array(data, data_size, operation, rootrank)
+    implicit none
+    integer, intent(in) :: data_size, operation, rootrank
+    real(kind=8), intent(inout) :: data(data_size)
+    real(kind=8), allocatable :: buf(:)
+#ifdef MPI
+    allocate( buf(data_size) )
+    call mpi_reduce(data, buf, data_size, mpi_double_precision, operation, rootrank, mpi_comm_world, ierror)
+    data(:) = buf(:)
+    deallocate(buf)
+#endif
+  end subroutine mympi_reduce_real8_array
+
+  subroutine mympi_reduce_real_scalar(data, operation, rootrank)
+    implicit none
+    integer, intent(in) :: operation, rootrank
+    real(wp), intent(inout) :: data
+    real(wp) :: buf
+    integer :: mympi_realkind
+#ifdef MPI
+    call get_mympi_realkind(kind(data), mympi_realkind)
+    call mpi_reduce(data, buf, 1, mympi_realkind, operation, rootrank, mpi_comm_world, ierror)
+    data = buf
+#endif
+  end subroutine mympi_reduce_real_scalar
+
+  subroutine mympi_reduce_real8_scalar(data, operation, rootrank)
+    implicit none
+    integer, intent(in) :: operation, rootrank
+    real(kind=8), intent(inout) :: data
+    real(kind=8) :: buf
+#ifdef MPI
+    call mpi_reduce(data, buf, 1, mpi_double_precision, operation, rootrank, mpi_comm_world, ierror)
+    data = buf
+#endif
+  end subroutine mympi_reduce_real8_scalar
+
+  subroutine get_mympi_realkind(data_kind, local_realkind)
+    implicit none
+    integer, intent(in) :: data_kind
+    integer, intent(out) :: local_realkind
+#ifdef MPI
+    select case(data_kind)
+    case(4)
+       local_realkind = mpi_real
+    case(8)
+       local_realkind = mpi_double_precision
+    case default
+       stop "invalid kind(real) value"
+    end select
+#endif
+  end subroutine get_mympi_realkind
+
+
+  ! Stop calculation with error message
+  subroutine halt_with_error(errtype)
+    use engmain, only: slttype, stdout, SLT_REFS_FLEX
+    implicit none
+    character(len=7), intent(in) :: errtype
+
+    select case(errtype)
+    case('eng_typ')
+       write(stdout, "(A)") " The number of solute types is incorrectly set"
+    case('eng_num')
+       write(stdout, "(A)") " The number of solute molecules is incorrectly set"
+    case('eng_ins')
+       write(stdout, "(A)") " The solute numbering is incorrect for insertion"
+    case('eng_par')
+       write(stdout, "(A)") " The input parameter is incorrectly set"
+    case('eng_siz')
+       write(stdout, "(A)") " The number of energy-coordinate meshes is too large"
+    case('eng_min')
+       write(stdout, "(A)") " The minimum of the energy coordinate is too high; " // &
+            "the ecdmin parameter needs to be lower"
+       if (slttype == SLT_REFS_FLEX) then
+          write(stdout, '(A)') " If ecdmin seems unphysically negative, the solute structure in SltConf could be fragmented. " &
+               // "If so, unwrap the trajectory for the isolated solute and link SltConf to the unwrapped trajectory"
+       endif
+    case('eng_sft')
+       write(stdout, "(A)") " The eccore parameter is too small; " // &
+            "there should be no distribution at energy coordinate larger than eccore in the solution system"
+    case('eng_pcr')
+       write(stdout, "(A)") " The pecore parameter is incorrectly set"
+    case('eng_ecd')
+       write(stdout, "(A)") " The energy-coordinate system is inconsistent"
+    case('eng_per')
+       write(stdout, "(A)") " parameters_er file does not exist"
+    case('eng_eci')
+       write(stdout, "(A)") " EcdInfo file does not exist"
+    case('eng_ecm')
+       write(stdout, "(A)") " EcdMesh file does not exist"
+    case('eng_emf')
+       write(stdout, "(A)") " EcdMesh file has wrong format"
+    case('eng_cns')
+       write(stdout, "(A)") " Inconsistency is present in the engproc program"
+    case('eng_slb')
+       write(stdout, "(A)") " Slab condition can only used in periodic system"
+    case('eng_bug')
+       write(stdout, "(A)") " Bug in engproc.F90"
+
+    case('rcp_fst')
+       write(stdout, "(A)") " The first particle needs to be the solute"
+    case('rcp_cns')
+       write(stdout, "(A)") " Inconsistency is present in the recpcal program"
+
+    case('ins_set')
+       write(stdout, "(A)") " The solute specification is incorrectly set"
+    case('ins_siz')
+       write(stdout, "(A)") " Inconsistency is present in the setting of the size of bfcoord"
+    case('ins_geo')
+       write(stdout, "(A)") " The system geometry is incorrectly set"
+    case('ins_ref')
+       write(stdout, "(A)") " RefInfo file is missing"
+    case('ins_str')
+       write(stdout, "(A)") " Incorrect size for RefInfo file"
+    case('ins_bug')
+       write(stdout, "(A)") " Bug in insertion.F90"
+
+    case('set_slt')
+       write(stdout, "(A)") " The solute type is incorrectly set"
+    case('set_num')
+       write(stdout, "(A)") " The number of molecules or atoms is incorrectly set"
+    case('set_prs')
+       write(stdout, "(A)") " The system parameters are incorrectly set"
+    case('set_ins')
+       write(stdout, "(A)") " The insertion parameters are incorrectly set"
+    case('set_reg')
+       write(stdout, "(A)") " The lwreg and/or upreg parameter is incorrectly set"
+    case('set_str')
+       write(stdout, "(A)") " The lwstr and/or upstr parameter is incorrectly set"
+    case('set_ewa')
+       write(stdout, "(A)") " The Ewald parameters are incorrectly set"
+    case('set_trj')
+       write(stdout, "(A)") " Trajectory is shorter than specified in MDinfo"
+    case('set_pmt')
+       write(stdout, "(A)") " Permutation index file is invalid"
+    case('set_bug')
+       write(stdout, "(A)") " Bug in setconf.F90"
+
+    case('bst_zrw')
+       write(stdout, "(A)") " Division by zero due to inappropriate setting of mass or weight"
+
+    case default
+       write(stdout, "(A,A)") " Unknown error code passed to halt_with_error: ", errtype
+    end select
+
+    call mpi_abend()                                                     ! MPI
+    stop
+  end subroutine halt_with_error
+
+  subroutine warning(typ)
+    use engmain, only: stdout, force_calculation
+    implicit none
+    character(len=4), intent(in) :: typ
+    select case(typ)
+    case('mbin')
+       write(stdout, '(A)') " Warning: the maximum binning energy is too low for this species"
+    case('emax')
+       write(stdout, '(A)') " Warning: number of total bins in distribution function is too large" // &
+            " (and will presumably require large memory)"
+    case('cell')
+       write(stdout, '(A)') " Warning: the simulation cell is not upper-triangular; " // &
+            "rotating the coordinate system so that it is"
+    case('cel2')
+       write(stdout, '(A)') " Warning: a cell vector is tilted more than half of another axis; " // &
+            "wrapping it back by an integer multiple of that axis"
+    end select
+    if (force_calculation) return
+    write(stdout, '(A)') "The program aborts because there is a warning"
+    write(stdout, '(A,A)') "If you wish to force program running, specify 'force_calculation = .true.' in parameters_er, ", &
+         "at &ene_param section."
+
+    call mpi_abend()
+    stop
+  end subroutine warning
+end module mpiproc                                                       ! MPI
