@@ -2,7 +2,7 @@
 
 # autoconf <= 2.64 has a bug in AC_OPENMP
 AC_PREREQ([2.65])
-AC_INIT(erdst-openacc, 1.0.0, Matubayasi Laboratory)
+AC_INIT(erdst-openmp, 1.0.0, Matubayasi Laboratory)
 AC_CONFIG_MACRO_DIR(m4)
 AM_INIT_AUTOMAKE
 
@@ -270,6 +270,25 @@ AC_LANG_POP(Fortran)
 
 # AM_CONDITIONAL([MPI], [test x$use_mpi = xyes])
 AM_CONDITIONAL([USE_VMDPLUGIN], [test x$enable_vmdplugin = xyes || test x$enable_vmdplugin = x])
+
+# Sources shared with the OpenACC build live in ../erdst-common. They are
+# brought into this directory as symbolic links at configure time rather
+# than listed as ../erdst-common/foo.F90 in Makefile.am: with the latter,
+# automake's subdir-objects would put the object files (and the compiler
+# the .mod files) next to the shared sources, where the OpenACC and
+# OpenMP builds -- different compilers -- would overwrite each other.
+# Links keep every build artifact in this directory.
+AS_IF([test ! -d "$srcdir/../erdst-common"],
+      [AC_MSG_ERROR([dnl
+Shared source directory $srcdir/../erdst-common not found. This build
+expects erdst-common/ to sit next to erdst-openmp/.])])
+AC_CONFIG_LINKS([precision.F90:../erdst-common/precision.F90
+                 spline.F90:../erdst-common/spline.F90
+                 trajectory.F90:../erdst-common/trajectory.F90
+                 utility.F90:../erdst-common/utility.F90
+                 enganal.F90:../erdst-common/enganal.F90
+                 vmdfio.c:../erdst-common/vmdfio.c
+                 hash_real.c:../erdst-common/hash_real.c])
 
 AC_CONFIG_FILES([Makefile])
 AC_CONFIG_HEADERS([config.h])
