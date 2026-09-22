@@ -15,8 +15,24 @@ AC_ARG_ENABLE([debug-symbol],
 AS_IF([test x$enable_debug = xno],
        ac_cv_prog_fc_g=no])
 
+AC_ARG_WITH([gpu],
+    [AS_HELP_STRING([--with-gpu=nvidia|amd],
+        [GPU toolchain for the linear-algebra solver. Default: detected
+         from the Fortran compiler (nvfortran -> nvidia, amdflang or
+         flang-new -> amd). nvidia uses OpenACC + cuSOLVER, amd uses
+         OpenMP target offload + hipSOLVER.])],
+    [with_gpu=$withval], [with_gpu=auto])
+
+AC_ARG_WITH([offload-arch],
+    [AS_HELP_STRING([--with-offload-arch=ARCH],
+        [AMD GPU architecture passed to --offload-arch, e.g. gfx942
+         (MI300A/MI300X), gfx90a (MI210/MI250). Only used for
+         --with-gpu=amd. Default: native, which needs a GPU on the build
+         machine; set it explicitly when building on a login node.])],
+    [with_offload_arch=$withval], [with_offload_arch=native])
+
 # Checks for programs.
-AC_PROG_FC([ifort xlf90 xlf f95 f90 frt gfortran g95 nvfortran])
+AC_PROG_FC([nvfortran amdflang flang-new])
 AC_PROG_LN_S
 
 # Check for buggy variant of ifort.
@@ -139,8 +155,38 @@ AS_IF([test x$enable_defaults != xno],
 CFLAGS="$CFLAGS"
 FCFLAGS="$FCFLAGS")
 
-# optimization flags
-FCFLAGS="$FCFLAGS -fast -Minfo=accel -acc -cudalib=cublas,cusolver"
+# GPU toolchain
+AS_IF([test "x$with_gpu" = "xauto"],
+      [AS_CASE([$FC],
+               [*nvfortran*], [with_gpu=nvidia],
+               [*amdflang*|*flang-new*|*flang*], [with_gpu=amd],
+               [AC_MSG_ERROR([dnl
+Could not tell which GPU toolchain to use from FC="$FC". Pass
+--with-gpu=nvidia (nvfortran) or --with-gpu=amd (amdflang).])])])
+
+GPU_LIBS=
+AS_CASE([$with_gpu],
+  [nvidia], [dnl
+    FCFLAGS="$FCFLAGS -fast -Minfo=accel -acc -cudalib=cublas,cusolver"
+  ],
+  [amd], [dnl
+    AS_IF([test "x$ROCM_PATH" = "x"], [ROCM_PATH=/opt/rocm])
+    # hipSOLVER is called through slvfe.F90's own bind(C) interfaces;
+    # only the enumerator values come from hipfort, hence the include
+    # path and no hipfort library.
+    AS_IF([test ! -f "$ROCM_PATH/include/hipfort/amdgcn/hipfort_hipsolver_enums.mod"],
+      [AC_MSG_ERROR([dnl
+Could not find $ROCM_PATH/include/hipfort/amdgcn/hipfort_hipsolver_enums.mod.
+Load your ROCm environment (which normally sets ROCM_PATH) and re-run.])])
+    # -O2 rather than -O3: amdflang can drop GPU kernels from the
+    # executable at -O3 (llvm/llvm-project issue #61483).
+    FCFLAGS="$FCFLAGS -O2 -fopenmp --offload-arch=$with_offload_arch -DUSE_HIP"
+    FCFLAGS="$FCFLAGS -I$ROCM_PATH/include/hipfort/amdgcn"
+    GPU_LIBS="-L$ROCM_PATH/lib -lhipsolver -lamdhip64"
+  ],
+  [AC_MSG_ERROR([Unknown value for --with-gpu: $with_gpu (expected nvidia or amd)])]
+)
+AC_SUBST([GPU_LIBS])
 AC_DEFUN([MY_FC_OPT_ACCEPT_NATIVE],[
 AC_CACHE_CHECK([fortran compiler accepts -march=native],
 my_fc_opt_accept_native_cv_flag,
@@ -159,7 +205,10 @@ AC_ARG_ENABLE([opt],
 	AS_HELP_STRING([--disable-opt],
 		[disable automatic edit to optimization flags]))
 
-AS_IF([test x$enable_opt = xyes || test x$enable_opt = x],
+# The AMD branch above sets its own optimisation level; the generic
+# editor below would append a bare -O for a non-GNU, non-Intel compiler,
+# which would override that -O2, so it is skipped there.
+AS_IF([test "x$with_gpu" != "xamd" && (test x$enable_opt = xyes || test x$enable_opt = x)],
   [FCFLAGS="$FCFLAGS"
    AS_IF([test x$ac_compiler_gnu = xyes],
         [optflag="-O3 -ffast-math -fno-finite-math-only"
@@ -197,8 +246,10 @@ AC_OUTPUT
 
 AC_MSG_RESULT([dnl
 OpenMP: $enable_openmp
+GPU: $with_gpu
 FC(for ermod)=$FC
 FCFLAGS=$FCFLAGS
+GPU_LIBS=$GPU_LIBS
 
 Configuration complete; type \"make\" to start compiling])
 

@@ -447,6 +447,93 @@ contains
 end module sysread
 
 
+#ifdef USE_HIP
+! Direct bindings to the hipSOLVER C API (libhipsolver) and to
+! hipDeviceSynchronize (libamdhip64). Bound directly rather than through
+! hipfort's generic interfaces so that the argument types are exactly
+! the C ones; only the enumerator values are taken from hipfort, to
+! avoid hand-copying them. hipSOLVER's "regular" API (hipsolverD*) is
+! used, whose potrs also takes a work area.
+module hipsolver_iface
+  use iso_c_binding
+  use hipfort_hipsolver_enums, only: HIPSOLVER_FILL_MODE_UPPER, &
+       HIPSOLVER_EIG_MODE_VECTOR, HIPSOLVER_STATUS_SUCCESS
+  implicit none
+  integer(c_int), parameter :: HIPSOLVER_STATUS_OK = HIPSOLVER_STATUS_SUCCESS
+
+  interface
+     function hipsolverCreate(handle) bind(C, name="hipsolverCreate") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr) :: handle
+       integer(c_int) :: r
+     end function hipsolverCreate
+
+     function hipsolverDestroy(handle) bind(C, name="hipsolverDestroy") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: handle
+       integer(c_int) :: r
+     end function hipsolverDestroy
+
+     function hipsolverDpotrf_bufferSize(handle, uplo, n, a, lda, lwork) &
+          bind(C, name="hipsolverDpotrf_bufferSize") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: handle, a
+       integer(c_int), value :: uplo, n, lda
+       integer(c_int) :: lwork
+       integer(c_int) :: r
+     end function hipsolverDpotrf_bufferSize
+
+     function hipsolverDpotrf(handle, uplo, n, a, lda, work, lwork, devinfo) &
+          bind(C, name="hipsolverDpotrf") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: handle, a, work, devinfo
+       integer(c_int), value :: uplo, n, lda, lwork
+       integer(c_int) :: r
+     end function hipsolverDpotrf
+
+     function hipsolverDpotrs_bufferSize(handle, uplo, n, nrhs, a, lda, b, ldb, lwork) &
+          bind(C, name="hipsolverDpotrs_bufferSize") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: handle, a, b
+       integer(c_int), value :: uplo, n, nrhs, lda, ldb
+       integer(c_int) :: lwork
+       integer(c_int) :: r
+     end function hipsolverDpotrs_bufferSize
+
+     function hipsolverDpotrs(handle, uplo, n, nrhs, a, lda, b, ldb, work, lwork, devinfo) &
+          bind(C, name="hipsolverDpotrs") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: handle, a, b, work, devinfo
+       integer(c_int), value :: uplo, n, nrhs, lda, ldb, lwork
+       integer(c_int) :: r
+     end function hipsolverDpotrs
+
+     function hipsolverDsyevd_bufferSize(handle, jobz, uplo, n, a, lda, w, lwork) &
+          bind(C, name="hipsolverDsyevd_bufferSize") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: handle, a, w
+       integer(c_int), value :: jobz, uplo, n, lda
+       integer(c_int) :: lwork
+       integer(c_int) :: r
+     end function hipsolverDsyevd_bufferSize
+
+     function hipsolverDsyevd(handle, jobz, uplo, n, a, lda, w, work, lwork, devinfo) &
+          bind(C, name="hipsolverDsyevd") result(r)
+       import :: c_ptr, c_int
+       type(c_ptr), value :: handle, a, w, work, devinfo
+       integer(c_int), value :: jobz, uplo, n, lda, lwork
+       integer(c_int) :: r
+     end function hipsolverDsyevd
+
+     function hipDeviceSynchronize() bind(C, name="hipDeviceSynchronize") result(r)
+       import :: c_int
+       integer(c_int) :: r
+     end function hipDeviceSynchronize
+  end interface
+end module hipsolver_iface
+#endif
+
+
 module sfecalc
   use sysvars, only: invmtrx, zerosft, wgtfnform, slncor, &
        numslv, ermax, nummol, kT, norm_error, itrmax, zero, tiny, &
@@ -461,6 +548,23 @@ module sfecalc
   real,    allocatable :: zrsln(:), zrref(:), zrsdr(:)
   integer gemax
 contains
+  ! ------------------------------------------------------------------
+  ! Dense linear algebra on the GPU. Only these two routines touch the
+  ! GPU in slvfe; everything else runs on the host. The NVIDIA build uses
+  ! cuSOLVER through OpenACC, the AMD build (-DUSE_HIP) uses hipSOLVER
+  ! through OpenMP target offload. Both keep the same interface and the
+  ! same semantics:
+  !   posv_wrap : solve mat * x = vec for symmetric positive definite
+  !               mat (Cholesky); x is returned in vec. info /= 0 means
+  !               failure (factorisation failed, residual too large, or
+  !               a library/allocation error), and the caller then falls
+  !               back to syevr_wrap.
+  !   syevr_wrap: eigenvalues/eigenvectors of symmetric mat.
+  ! "real" is promoted to 8 bytes by configure, so the double-precision
+  ! library routines are the right ones.
+  ! ------------------------------------------------------------------
+#ifndef USE_HIP
+  ! ---------------- NVIDIA: OpenACC + cuSOLVER ----------------
   subroutine posv_wrap(n, mat, vec, info)
     use iso_c_binding
     use cuBlas_v2
@@ -471,13 +575,15 @@ contains
     real, intent(inout) :: vec(n)
     integer, intent(out) :: info
     type(cuSolverDnHandle) :: h
-    integer :: istat, lwork
+    integer :: istat, lwork, info_f, info_s
     real, allocatable :: input_mat(:, :)
     real, allocatable :: input_vec(:), residual(:)
     real, allocatable :: work(:)
     real, parameter :: residual_error = 1.0e-6, abs_error = 1.0e6
 
+    info = -1
     istat = cuSolverDnCreate(h)
+    if (istat /= CUSOLVER_STATUS_SUCCESS) return
 
     lwork = -1
     !$acc data copyin(mat)
@@ -487,7 +593,8 @@ contains
     !$acc end host_data
     !$acc end data
 
-    if (istat /= 0) then
+    if (istat /= CUSOLVER_STATUS_SUCCESS) then
+       istat = cuSolverDnDestroy(h)
        return
     endif
 
@@ -495,15 +602,25 @@ contains
     input_mat(:, :) = mat(:, :)
     input_vec(:) = vec(:)
     allocate(work(lwork))
+    ! potrf and potrs report through separate info variables: sharing
+    ! one let potrs overwrite a failed factorisation's code with 0
+    info_f = 0
+    info_s = 0
     !$acc enter data create(work)
-    !$acc data copy(mat, vec) copyout(info)
-    !$acc host_data use_device(mat, vec, work, info)
+    !$acc data copy(mat, vec) copyout(info_f, info_s)
+    !$acc host_data use_device(mat, vec, work, info_f, info_s)
     istat = cusolverDnDpotrf(h, CUBLAS_FILL_MODE_UPPER, &
-         n, mat, n, work, lwork, info)
+         n, mat, n, work, lwork, info_f)
     istat = cusolverDnDpotrs(h, CUBLAS_FILL_MODE_UPPER, &
-         n, 1, mat, n, vec, n, info)
+         n, 1, mat, n, vec, n, info_s)
     !$acc end host_data
     !$acc end data
+    ! (this exit data was missing, leaking the work area on every call)
+    !$acc exit data delete(work)
+    deallocate(work)
+
+    info = info_f
+    if (info == 0) info = info_s
 
     if (info == 0) then
        residual(:) = matmul( input_mat(:, :), vec(:) )
@@ -519,6 +636,7 @@ contains
     endif
 
     deallocate( input_mat, input_vec, residual )
+    istat = cuSolverDnDestroy(h)
   end subroutine posv_wrap
 
   subroutine syevr_wrap(n, mat, eigval, info)
@@ -533,7 +651,9 @@ contains
     integer :: istat, lwork
     real(kind=8), allocatable :: work(:)
 
+    info = -1
     istat = cuSolverDnCreate(h)
+    if (istat /= CUSOLVER_STATUS_SUCCESS) return
 
     lwork = -1
     !$acc data copyin(mat, eigval)
@@ -543,7 +663,8 @@ contains
     !$acc end host_data
     !$acc end data
 
-    if (istat /= 0) then
+    if (istat /= CUSOLVER_STATUS_SUCCESS) then
+       istat = cuSolverDnDestroy(h)
        return
     endif
 
@@ -558,7 +679,157 @@ contains
     !$acc end data
     !$acc exit data delete(work)
     deallocate(work)
+    istat = cuSolverDnDestroy(h)
   end subroutine syevr_wrap
+
+#else
+  ! ---------------- AMD: OpenMP target offload + hipSOLVER ----------------
+  !
+  ! Lessons carried over from the erdst port to AMD:
+  !  * device addresses are fetched explicitly with omp_get_mapped_ptr;
+  !    c_loc() inside a use_device_addr region returns the host address
+  !    with amdflang, which on an APU silently operates on host memory;
+  !  * hipSOLVER runs on HIP's stream, unordered with OpenMP's, so the
+  !    device is synchronised before OpenMP copies the results back.
+
+  subroutine posv_wrap(n, mat, vec, info)
+    use iso_c_binding
+    use omp_lib, only: omp_get_mapped_ptr, omp_get_default_device
+    use hipsolver_iface
+    implicit none
+    integer, intent(in) :: n
+    real, intent(inout), target :: mat(n, n)
+    real, intent(inout), target :: vec(n)
+    integer, intent(out) :: info
+    type(c_ptr) :: h, p_mat, p_vec, p_work, p_info_f, p_info_s
+    integer(c_int) :: stat, lwork_f, lwork_s, lwork
+    integer(c_int), target :: info_f, info_s
+    integer :: dev
+    logical :: ok
+    real, allocatable :: input_mat(:, :)
+    real, allocatable :: input_vec(:), residual(:)
+    real, allocatable, target :: work(:)
+    real, parameter :: residual_error = 1.0e-6, abs_error = 1.0e6
+
+    info = -1
+    stat = hipsolverCreate(h)
+    if (stat /= HIPSOLVER_STATUS_OK) return
+
+    allocate( input_mat(n, n), input_vec(n), residual(n) )
+    input_mat(:, :) = mat(:, :)
+    input_vec(:) = vec(:)
+    info_f = 0
+    info_s = 0
+    ok = .false.
+    dev = omp_get_default_device()
+
+    !$omp target data map(tofrom: mat, vec) map(from: info_f, info_s)
+    p_mat    = omp_get_mapped_ptr(c_loc(mat(1, 1)), dev)
+    p_vec    = omp_get_mapped_ptr(c_loc(vec(1)), dev)
+    p_info_f = omp_get_mapped_ptr(c_loc(info_f), dev)
+    p_info_s = omp_get_mapped_ptr(c_loc(info_s), dev)
+    if (c_associated(p_mat) .and. c_associated(p_vec) .and. &
+        c_associated(p_info_f) .and. c_associated(p_info_s)) then
+       ! hipSOLVER's potrs, unlike cuSOLVER's, takes a work area too
+       stat = hipsolverDpotrf_bufferSize(h, HIPSOLVER_FILL_MODE_UPPER, &
+            n, p_mat, n, lwork_f)
+       if (stat == HIPSOLVER_STATUS_OK) &
+            stat = hipsolverDpotrs_bufferSize(h, HIPSOLVER_FILL_MODE_UPPER, &
+            n, 1, p_mat, n, p_vec, n, lwork_s)
+       if (stat == HIPSOLVER_STATUS_OK) then
+          lwork = max(lwork_f, lwork_s, 1)
+          allocate(work(lwork))
+          !$omp target enter data map(alloc: work)
+          p_work = omp_get_mapped_ptr(c_loc(work(1)), dev)
+          if (c_associated(p_work)) then
+             stat = hipsolverDpotrf(h, HIPSOLVER_FILL_MODE_UPPER, &
+                  n, p_mat, n, p_work, lwork, p_info_f)
+             if (stat == HIPSOLVER_STATUS_OK) &
+                  stat = hipsolverDpotrs(h, HIPSOLVER_FILL_MODE_UPPER, &
+                  n, 1, p_mat, n, p_vec, n, p_work, lwork, p_info_s)
+             ! finish on the GPU before OpenMP copies results back
+             if (hipDeviceSynchronize() /= 0) stat = -1
+             ok = (stat == HIPSOLVER_STATUS_OK)
+          end if
+          !$omp target exit data map(delete: work)
+          deallocate(work)
+       end if
+    end if
+    !$omp end target data
+
+    if (ok) then
+       info = info_f
+       if (info == 0) info = info_s
+    end if
+
+    if (info == 0) then
+       residual(:) = matmul( input_mat(:, :), vec(:) )
+       residual(:) = abs( residual(:) - input_vec(:) )
+       ! Too large residual values = failure to solve the linear equation
+       if (maxval( residual(:) ) > residual_error) info = 1
+       ! Next line is for a pathological case.
+       ! In case that there are more null space than initially expected
+       ! and with a numerical error that it may have very small eigenvalues,
+       ! the solution from POSV call exhibits extremely large values.
+       ! Such a case is detected by taking the absolute of vector element.
+       if (maxval( abs( vec(:) ) ) > abs_error) info = 1
+    endif
+
+    deallocate( input_mat, input_vec, residual )
+    stat = hipsolverDestroy(h)
+  end subroutine posv_wrap
+
+  subroutine syevr_wrap(n, mat, eigval, info)
+    use iso_c_binding
+    use omp_lib, only: omp_get_mapped_ptr, omp_get_default_device
+    use hipsolver_iface
+    implicit none
+    integer, intent(in) :: n
+    real, intent(inout), target :: mat(n, n)
+    real, intent(out), target :: eigval(n)
+    integer, intent(out) :: info
+    type(c_ptr) :: h, p_mat, p_eig, p_work, p_info
+    integer(c_int) :: stat, lwork
+    integer(c_int), target :: dinfo
+    integer :: dev
+    real, allocatable, target :: work(:)
+
+    info = -1
+    stat = hipsolverCreate(h)
+    if (stat /= HIPSOLVER_STATUS_OK) return
+
+    dinfo = 0
+    dev = omp_get_default_device()
+
+    !$omp target data map(tofrom: mat) map(from: eigval, dinfo)
+    p_mat  = omp_get_mapped_ptr(c_loc(mat(1, 1)), dev)
+    p_eig  = omp_get_mapped_ptr(c_loc(eigval(1)), dev)
+    p_info = omp_get_mapped_ptr(c_loc(dinfo), dev)
+    if (c_associated(p_mat) .and. c_associated(p_eig) .and. c_associated(p_info)) then
+       stat = hipsolverDsyevd_bufferSize(h, HIPSOLVER_EIG_MODE_VECTOR, &
+            HIPSOLVER_FILL_MODE_UPPER, n, p_mat, n, p_eig, lwork)
+       if (stat == HIPSOLVER_STATUS_OK) then
+          lwork = max(lwork, 1)
+          allocate(work(lwork))
+          !$omp target enter data map(alloc: work)
+          p_work = omp_get_mapped_ptr(c_loc(work(1)), dev)
+          if (c_associated(p_work)) then
+             stat = hipsolverDsyevd(h, HIPSOLVER_EIG_MODE_VECTOR, &
+                  HIPSOLVER_FILL_MODE_UPPER, n, p_mat, n, p_eig, &
+                  p_work, lwork, p_info)
+             if (hipDeviceSynchronize() /= 0) stat = -1
+             if (stat == HIPSOLVER_STATUS_OK) info = 0
+          end if
+          !$omp target exit data map(delete: work)
+          deallocate(work)
+       end if
+    end if
+    !$omp end target data
+
+    if (info == 0) info = dinfo
+    stat = hipsolverDestroy(h)
+  end subroutine syevr_wrap
+#endif
 
   subroutine chmpot(prmcnt, cntrun)
     use sysvars, only: uvread, slfslt, ljlrc, normalize, showdst, wrtzrsft, &
